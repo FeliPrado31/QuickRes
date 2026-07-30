@@ -1,11 +1,83 @@
 import ctypes
+import json
+import os
 import re
+import subprocess
 import sys
+import urllib.request
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 user32 = ctypes.windll.user32
+
+CURRENT_VERSION = "1.0.0"
+UPDATE_URL = "https://lxzy.my/version.json"
+
+
+def check_for_update():
+    if not getattr(sys, "frozen", False):
+        return
+
+    try:
+        with urllib.request.urlopen(UPDATE_URL, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return
+
+    latest_version = data.get("version", "")
+    download_url = data.get("url", "")
+    if not latest_version or not download_url:
+        return
+
+    def version_tuple(v):
+        return tuple(int(p) for p in v.split("."))
+
+    try:
+        is_newer = version_tuple(latest_version) > version_tuple(CURRENT_VERSION)
+    except ValueError:
+        return
+
+    if not is_newer:
+        return
+
+    if messagebox.askyesno(
+        "Update available",
+        f"QuickRes {latest_version} is available (you have {CURRENT_VERSION}).\n\nUpdate now?"
+    ):
+        apply_update(download_url)
+
+
+def apply_update(download_url):
+    exe_path = os.path.abspath(sys.executable)
+    exe_dir = os.path.dirname(exe_path)
+    new_exe_path = os.path.join(exe_dir, "QuickRes_new.exe")
+    bat_path = os.path.join(exe_dir, "update.bat")
+
+    try:
+        urllib.request.urlretrieve(download_url, new_exe_path)
+    except Exception:
+        messagebox.showerror("Update failed", "Could not download the update. Try again later.")
+        return
+
+    bat_contents = (
+        "@echo off\n"
+        "timeout /t 1 /nobreak >nul\n"
+        f'del "{exe_path}"\n'
+        f'move /y "{new_exe_path}" "{exe_path}"\n'
+        f'start "" "{exe_path}"\n'
+        'del "%~f0"\n'
+    )
+
+    with open(bat_path, "w") as f:
+        f.write(bat_contents)
+
+    subprocess.Popen(
+        ["cmd", "/c", bat_path],
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+    )
+
+    sys.exit(0)
 
 class DEVMODE(ctypes.Structure):
     _fields_ = [
@@ -56,6 +128,7 @@ def set_resolution(width: int, height: int) -> tuple[bool, str]:
 QUICK_LIST = [
     ("1920 x 1080", 1920, 1080),
     ("2560 x 1440", 2560, 1440),
+    ("1920 x 1440", 1920, 1440),
     ("1440 x 1080", 1440, 1080),
     ("1600 x 1080", 1600, 1080),
     ("1280 x 1080", 1280, 1080),
@@ -81,8 +154,9 @@ FAQ_ITEMS = [
     ),
     (
         "Screen looks wrong after switching?",
-        "Make sure Valorant is on fill ratio before you "
-        "switch to a stretched res. You have to do this every match not round. and switching too "
+        "Make sure Valorant is on the fill/agent select screen before you "
+        "switch to a stretched res. You have to do this every match, since "
+        "loading into a new game resets your resolution and switching too "
         "early will give you black bars. Using QuickRes for this is a lot "
         "faster than going through NVIDIA Control Panel (or AMD/Intel) "
         "manually every time."
@@ -145,6 +219,8 @@ class ResSwitcherApp(tk.Tk):
             bottom_row, text="GitHub",
             command=lambda: webbrowser.open("https://github.com/lxzydev/QuickRes")
         ).pack(side="left", padx=4)
+
+        self.after(500, check_for_update)
 
     def show_faq(self):
         faq_win = tk.Toplevel(self)
