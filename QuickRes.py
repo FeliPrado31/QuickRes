@@ -147,6 +147,21 @@ QUICK_LIST = [
     ("1280 x 960", 1280, 960),
 ]
 
+def resource_path(relative_path):
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(os.path.join(getattr(sys, "_MEIPASS", ""), relative_path))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), relative_path))
+    else:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path))
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    return candidates[0]
+
+
 FAQ_ITEMS = [
     (
         "Why doesn't my custom resolution work?",
@@ -180,10 +195,15 @@ class ResSwitcherApp(tk.Tk):
 
         self.title("QuickRes")
         self.resizable(False, False)
-        self.geometry("280x460")
+        self.geometry("300x500")
+
+        try:
+            self.iconbitmap(resource_path("icon.ico"))
+        except Exception:
+            pass
 
         self.update_idletasks()
-        w, h = 280, 460
+        w, h = 300, 500
         x = (self.winfo_screenwidth() // 2) - (w // 2)
         y = (self.winfo_screenheight() // 2) - (h // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
