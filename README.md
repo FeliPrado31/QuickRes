@@ -1,9 +1,5 @@
 # QuickRes
 
-<p align="center">
-  <img src="icon.png" width="140" alt="QuickRes">
-</p>
-
 A tiny Windows tool for instantly switching your resolution with one click.
 
 Built with stretched resolutions for Valorant in mind, but it works for switching resolution on anything.
