@@ -1,4 +1,7 @@
 # QuickRes
+<p align="center">
+  <img src="QuickRes.png" width="140" alt="QuickRes">
+</p>
 
 A tiny Windows tool for instantly switching your resolution with one click.
 
