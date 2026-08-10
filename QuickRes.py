@@ -27,7 +27,7 @@ def enforce_single_instance():
         sys.exit(0)
     return mutex
 
-CURRENT_VERSION = "1.0.3"
+CURRENT_VERSION = "1.0.4"
 UPDATE_URL = "https://lxzy.my/version.json"
 
 
@@ -160,8 +160,10 @@ class DEVMODE(ctypes.Structure):
 
 DM_PELSWIDTH = 0x80000
 DM_PELSHEIGHT = 0x100000
-DM_DISPLAYFREQUENCY = 0x400000
-DM_BITSPERPEL = 0x40000
+
+CDS_UPDATEREGISTRY = 0x00000001
+CDS_NORESET = 0x10000000
+CDS_RESET = 0x40000000
 
 
 def detect_gpu_vendors() -> set:
@@ -265,35 +267,33 @@ def open_intel_graphics_software():
 ENUM_CURRENT_SETTINGS = -1
 
 
-def get_supported_resolutions() -> dict:
-    supported = {}
+def get_supported_resolutions() -> set:
+    supported = set()
     devmode = DEVMODE()
     devmode.dmSize = ctypes.sizeof(DEVMODE)
     i = 0
     while user32.EnumDisplaySettingsW(None, i, ctypes.byref(devmode)):
-        key = (devmode.dmPelsWidth, devmode.dmPelsHeight)
-        freq = devmode.dmDisplayFrequency
-        if key not in supported or freq > supported[key].dmDisplayFrequency:
-            best = DEVMODE()
-            ctypes.memmove(ctypes.byref(best), ctypes.byref(devmode), ctypes.sizeof(DEVMODE))
-            supported[key] = best
+        supported.add((devmode.dmPelsWidth, devmode.dmPelsHeight))
         i += 1
     return supported
 
 
-def set_resolution(width: int, height: int, matched_devmode=None) -> tuple[bool, str]:
+def set_resolution(width: int, height: int) -> tuple[bool, str]:
     devmode = DEVMODE()
     devmode.dmSize = ctypes.sizeof(DEVMODE)
+    devmode.dmPelsWidth = width
+    devmode.dmPelsHeight = height
+    devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
 
-    if matched_devmode is not None:
-        ctypes.memmove(ctypes.byref(devmode), ctypes.byref(matched_devmode), ctypes.sizeof(DEVMODE))
-        devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL
-    else:
-        devmode.dmPelsWidth = width
-        devmode.dmPelsHeight = height
-        devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
+    result = user32.ChangeDisplaySettingsW(
+        ctypes.byref(devmode), CDS_UPDATEREGISTRY | CDS_NORESET
+    )
 
-    result = user32.ChangeDisplaySettingsW(ctypes.byref(devmode), 0)
+    if result != 0:
+        return False, (f"Error code {result}. Try running as Administrator, "
+                        f"or that resolution isn't registered with your GPU driver.")
+
+    result = user32.ChangeDisplaySettingsW(None, CDS_RESET)
 
     if result == 0:
         return True, f"Now running {width} x {height}"
@@ -313,8 +313,10 @@ QUICK_LIST = [
     ("1280 x 1080", 1280, 1080),
     ("1350 x 1080", 1350, 1080),
     ("1280 x 1024", 1280, 1024),
-    ("1280 x 960", 1280, 960),
     ("1080 x 1080", 1080, 1080),
+    ("1280 x 960", 1280, 960),
+    ("1024 x 768", 1024, 768),
+    ("800 x 1080", 800, 1080),
 ]
 
 def resource_path(relative_path):
@@ -645,11 +647,10 @@ class ResSwitcherApp(tk.Tk):
 
     def apply_resolution(self, width, height):
         colors = THEMES[self.theme_name]
-        key = (width, height)
-        if key not in self.supported_resolutions:
+        if (width, height) not in self.supported_resolutions:
             self.unsupported_click(width, height)
             return
-        ok, msg = set_resolution(width, height, self.supported_resolutions[key])
+        ok, msg = set_resolution(width, height)
         self.status_label.config(fg=colors["status_ok"] if ok else colors["status_err"])
         self.status_var.set(msg)
 
