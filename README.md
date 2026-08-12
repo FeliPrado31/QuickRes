@@ -55,5 +55,4 @@ This project is fully open source. Feel free to modify it for your own use.
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --noconsole --name QuickRes quickres.py
-```
+python -m PyInstaller --onefile --noconsole --name QuickRes --icon icon.ico --add-data "icon.ico;." main.py```
