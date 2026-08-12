@@ -31,24 +31,31 @@ class HotkeyToggle:
         self.on_status = on_status
         self._thread = None
         self._thread_id = None
+        self._ready = threading.Event()
         self.is_stretched = False
 
     def start(self):
+        self._ready.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        self._ready.wait(timeout=2)
 
     def stop(self):
         if self._thread_id:
             user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         if self._thread:
             self._thread.join(timeout=2)
+        self._thread_id = None
 
     def _run(self):
-        self._thread_id = kernel32.GetCurrentThreadId()
+        thread_id = kernel32.GetCurrentThreadId()
         if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_NOREPEAT, self.vk_code):
             self.on_status(f"Could not register {self.key_name}, it may be in use")
-            self._thread_id = None
+            self._ready.set()
             return
+
+        self._thread_id = thread_id
+        self._ready.set()
 
         self.on_status(f"Hotkey active: {self.key_name} toggles resolution")
         log_msg(f"Hotkey {self.key_name} registered")
