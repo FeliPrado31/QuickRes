@@ -60,6 +60,13 @@ def save_config(config_dict: dict):
         pass
 
 
+def update_config(updates: dict):
+    cfg = load_config()
+    cfg.update(updates)
+    save_config(cfg)
+    return cfg
+
+
 def enforce_single_instance():
     mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
