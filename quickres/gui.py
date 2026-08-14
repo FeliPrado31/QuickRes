@@ -587,9 +587,16 @@ class ResSwitcherApp(tk.Tk):
 
     def _check_pending_restore_on_startup(self):
         pending = load_pending_restore()
-        if pending is not None:
-            self._active_pending_instance_id = pending.get("instance_id")
-            self._show_restore_banner()
+        if pending is None:
+            return
+        instance_id = pending.get("instance_id")
+        if not instance_id:
+            # Nothing actionable in this record — don't lock the UI or show
+            # a banner over a flag that can never be resolved either way.
+            clear_pending_restore()
+            return
+        self._active_pending_instance_id = instance_id
+        self._show_restore_banner()
 
     def _show_restore_banner(self):
         if self.restore_banner is None:
@@ -607,6 +614,12 @@ class ResSwitcherApp(tk.Tk):
             self.restore_banner.pack_forget()
 
     def _restore_pending_from_banner(self):
+        # Reentrancy guard: without this, clicking the banner twice quickly
+        # (or once while an op from elsewhere is already running) could
+        # launch two elevated processes racing CM_Enable/CM_Disable calls
+        # against the same device.
+        if self._monitor_op_in_flight:
+            return
         pending = load_pending_restore()
         if pending is None:
             self._hide_restore_banner()
@@ -692,7 +705,15 @@ class ResSwitcherApp(tk.Tk):
                 ok, message = op_func(instance_id)
             except Exception as e:
                 ok, message = False, f"Unexpected error: {e}"
-            self.after(0, lambda: on_done(ok, message))
+            try:
+                self.after(0, lambda: on_done(ok, message))
+            except Exception:
+                # Main window was closed while this op was still running.
+                # The elevated helper's real work (CM_Disable/Enable) has
+                # already happened regardless — pending_restore.json still
+                # correctly reflects reality on disk even though there's no
+                # UI left to update.
+                pass
         threading.Thread(target=worker, daemon=True).start()
 
     def show_monitors(self):
@@ -730,7 +751,46 @@ class ResSwitcherApp(tk.Tk):
         close_btn.pack(side="bottom", pady=(0, 14))
         self.monitors_themed_widgets.append(close_btn)
 
+        self._reconcile_stuck_pending()
         self._refresh_monitor_list()
+
+    def _reconcile_stuck_pending(self):
+        # A disable that hit TIMEOUT_MESSAGE leaves _active_pending_instance_id
+        # set with no confirm/revert dialog driving it (we didn't know the
+        # outcome yet, so none was opened) — the UI stays locked until this
+        # resolves. By the time the user reopens Monitors, the elevated
+        # helper has almost certainly finished one way or the other, so
+        # re-check now instead of leaving them stuck until an app restart.
+        if self._active_pending_instance_id is None:
+            return
+        if self.revert_win is not None and self.revert_win.winfo_exists():
+            return  # a normal awaiting-confirmation dialog is already open
+        if self._monitor_op_in_flight:
+            return  # something is actively running right now, don't interfere
+
+        pending = load_pending_restore()
+        if pending is None:
+            self._active_pending_instance_id = None
+            return
+        instance_id = pending.get("instance_id")
+        friendly_name = pending.get("friendly_name", "the monitor")
+        if not instance_id:
+            clear_pending_restore()
+            self._active_pending_instance_id = None
+            return
+
+        actual = self._find_monitor(instance_id)
+        if actual is None:
+            return  # still can't confirm — stay locked, fail safe
+        if actual.is_enabled:
+            # Confirmed back on — nothing left to protect.
+            clear_pending_restore()
+            self._active_pending_instance_id = None
+        else:
+            # Confirmed disabled — resume the normal keep/revert flow instead
+            # of leaving it silently locked with no dialog to act on.
+            self._active_pending_instance_id = instance_id
+            self._open_revert_dialog(instance_id, friendly_name)
 
     def _close_monitors(self, win):
         self.monitors_win = None
@@ -802,6 +862,23 @@ class ResSwitcherApp(tk.Tk):
         friendly_name = monitor.friendly_name
 
         if monitor.is_enabled:
+            # Refuse to disable the only currently-enabled monitor: QuickRes
+            # is for turning off the *extra* monitor(s), not the one the
+            # user is actually looking at. Without this, disabling it blacks
+            # out the screen, and if the elevated call also happens to time
+            # out, there's no visible UI left to recover from.
+            other_enabled = [
+                m for m in monitors_mod.enumerate_monitors()
+                if m.is_enabled and m.instance_id != instance_id
+            ]
+            if not other_enabled:
+                self.status_label.config(fg=colors["status_err"])
+                self.status_var.set(
+                    f"Refusing to disable {friendly_name} — it's the only "
+                    f"enabled monitor. QuickRes is for disabling the extra "
+                    f"monitor(s), not your only display."
+                )
+                return
             # Disabling is the risky direction: write the crash-recovery flag
             # before we ever hand off to the elevated helper. If we can't
             # persist that flag, the whole safety net is void, so refuse to
@@ -931,6 +1008,11 @@ class ResSwitcherApp(tk.Tk):
         win.transient(self)
         win.configure(bg=colors["bg"])
         self.revert_win = win
+        # Dismissing via the titlebar X isn't a decision to "keep disabled" —
+        # treat it the same as clicking "Revert now" (the safe default),
+        # instead of leaving revert_win pointing at a destroyed widget while
+        # the countdown keeps running invisibly with no dialog left to act on.
+        win.protocol("WM_DELETE_WINDOW", lambda: self._revert_now(win, instance_id, friendly_name))
 
         dw, dh = 300, 160
         win.geometry(f"{dw}x{dh}")

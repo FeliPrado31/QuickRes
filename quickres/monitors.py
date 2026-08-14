@@ -2,6 +2,7 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -29,6 +30,17 @@ EDD_GET_DEVICE_INTERFACE_NAME = 0x00000001
 SEE_MASK_NOCLOSEPROCESS = 0x00000040
 SW_HIDE = 0
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+WAIT_OBJECT_0 = 0x00000000
+WAIT_TIMEOUT = 0x00000102
+WAIT_FAILED = 0xFFFFFFFF
+
+# SetupAPI instance IDs are vendor/EDID-derived (e.g.
+# "DISPLAY\DEL4110\5&2e2fefea&0&UID1078018") and normally only ever contain
+# these characters. This is interpolated into a double-quoted elevated-helper
+# command line (run_elevated_monitor_op) with no escaping, so a value outside
+# this shape is refused rather than risking a quote-breaking/argv-corrupting
+# injection into an admin-privileged process launch.
+_SAFE_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_&\\]+$")
 
 # Distinct from an ordinary failure: WaitForSingleObject timing out means the
 # elevated process (likely still waiting on a slow UAC prompt) is UNKNOWN,
@@ -155,6 +167,9 @@ cfgmgr32.CM_Disable_DevNode.argtypes = [wintypes.DWORD, wintypes.ULONG]
 shell32.ShellExecuteExW.restype = wintypes.BOOL
 shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
 
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+
 
 def _normalize_interface_id(device_id: str) -> str:
     """Convert an EnumDisplayDevices interface path into a SetupAPI instance id.
@@ -221,7 +236,19 @@ def enumerate_monitors() -> list:
             if not friendly_name:
                 friendly_name = instance_id or "Unknown monitor"
 
-            is_enabled = _is_devnode_enabled(devinfo.DevInst)
+            try:
+                is_enabled = _is_devnode_enabled(devinfo.DevInst)
+            except OSError:
+                # Can't determine this device's current status right now —
+                # omit it rather than guess. Callers that need this specific
+                # device (the crash-recovery re-check in gui.py) correctly
+                # treat "not found in the list" as "can't confirm" and fail
+                # safe, instead of trusting a wrong default.
+                index += 1
+                devinfo = SP_DEVINFO_DATA()
+                devinfo.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+                continue
+
             is_primary = attached_states.get(instance_id, False)
 
             monitors.append(Monitor(
@@ -277,9 +304,17 @@ def _is_devnode_enabled(devinst) -> bool:
     result = cfgmgr32.CM_Get_DevNode_Status(
         ctypes.byref(status), ctypes.byref(problem_number), devinst, 0
     )
-    if result == CR_SUCCESS and problem_number.value == CM_PROB_DISABLED:
-        return False
-    return True
+    if result != CR_SUCCESS:
+        # A CfgMgr32 failure here does NOT mean the device is enabled — it
+        # means we genuinely don't know. Silently defaulting to "enabled"
+        # would be dangerous: gui.py's crash-recovery false-negative
+        # re-check trusts this as ground truth to decide whether to clear
+        # pending_restore.json, and a wrong "enabled" reading for a monitor
+        # that's actually still disabled would erase its recovery flag.
+        # Raise instead so callers can fail safe (enumerate_monitors omits
+        # the device rather than guessing).
+        raise OSError(f"CM_Get_DevNode_Status failed (CONFIGRET error {result})")
+    return problem_number.value != CM_PROB_DISABLED
 
 
 def _set_devnode_enabled(instance_id: str, enable: bool):
@@ -330,6 +365,9 @@ def _cleanup_stale_result_files(max_age_s: float = 300.0):
 
 
 def run_elevated_monitor_op(op: str, instance_id: str, timeout_s: float = 30.0):
+    if not _SAFE_INSTANCE_ID_RE.match(instance_id):
+        return False, f"Refusing to process unexpected device id: {instance_id!r}"
+
     _cleanup_stale_result_files()
     result_path = os.path.join(
         APP_DIR, f"monitor_op_result_{os.getpid()}_{int(time.time() * 1000)}.json"
@@ -360,9 +398,17 @@ def run_elevated_monitor_op(op: str, instance_id: str, timeout_s: float = 30.0):
         return False, "Elevation was cancelled or failed"
 
     wait_result = kernel32.WaitForSingleObject(sei.hProcess, int(timeout_s * 1000))
-    if wait_result != 0:  # WAIT_OBJECT_0
+    if wait_result == WAIT_TIMEOUT:
         kernel32.CloseHandle(sei.hProcess)
         return False, TIMEOUT_MESSAGE
+    if wait_result != WAIT_OBJECT_0:
+        # A genuine wait error (e.g. WAIT_FAILED) is a confirmed, immediate
+        # failure — distinct from WAIT_TIMEOUT, which just means the process
+        # might still be running. Don't fold this into TIMEOUT_MESSAGE, or
+        # callers would wrongly treat a known failure as "unresolved, don't
+        # touch the recovery flag".
+        kernel32.CloseHandle(sei.hProcess)
+        return False, f"Elevated operation wait failed (code {wait_result})"
 
     exit_code = wintypes.DWORD(0)
     kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(exit_code))
