@@ -1,9 +1,14 @@
 import re
+import threading
+import time
 import webbrowser
 import tkinter as tk
 from tkinter import ttk
 
-from quickres.config import resource_path, load_config, update_config
+from quickres.config import (
+    resource_path, load_config, update_config,
+    save_pending_restore, load_pending_restore, clear_pending_restore,
+)
 from quickres.display import (
     QUICK_LIST,
     set_resolution,
@@ -16,6 +21,8 @@ from quickres.display import (
 )
 from quickres.updater import check_for_update
 from quickres.hotkey import HotkeyToggle, HOTKEY_OPTIONS
+from quickres import monitors as monitors_mod
+from quickres.monitors import PendingDisableGuard
 
 THEMES = {
     "light": {
@@ -116,6 +123,15 @@ class ResSwitcherApp(tk.Tk):
 
         self.faq_win = None
         self.faq_themed_widgets = []
+
+        self.monitors_win = None
+        self.monitors_themed_widgets = []
+        self.monitor_rows = {}
+        self.pending_guard = None
+        self.revert_win = None
+        self._monitor_op_in_flight = False
+        self._active_pending_instance_id = None
+        self.restore_banner = None
 
         title_label = tk.Label(
             self, text="QuickRes",
@@ -235,6 +251,13 @@ class ResSwitcherApp(tk.Tk):
         self.status_label = tk.Label(self, textvariable=self.status_var, wraplength=250, fg="green")
         self.status_label.pack(pady=(14, 0), padx=10)
 
+        self.restore_banner = tk.Button(
+            self, text="A monitor may still be disabled from a previous "
+                       "session - click to restore it",
+            wraplength=280, justify="left", relief="flat",
+            command=self._restore_pending_from_banner
+        )
+
         bottom_row = tk.Frame(self)
         bottom_row.pack(side="bottom", pady=(0, 14))
         self.themed_frames.append(bottom_row)
@@ -242,6 +265,10 @@ class ResSwitcherApp(tk.Tk):
         faq_btn = tk.Button(bottom_row, text="FAQ", command=self.show_faq)
         faq_btn.pack(side="left", padx=4)
         self.themed_buttons.append(faq_btn)
+
+        monitors_btn = tk.Button(bottom_row, text="Monitors", command=self.show_monitors)
+        monitors_btn.pack(side="left", padx=4)
+        self.themed_buttons.append(monitors_btn)
 
         self.theme_btn = tk.Button(bottom_row, text="Dark", width=5, command=self.toggle_theme)
         self.theme_btn.pack(side="left", padx=4)
@@ -263,6 +290,7 @@ class ResSwitcherApp(tk.Tk):
         self.apply_theme()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, check_for_update)
+        self._check_pending_restore_on_startup()
 
     def toggle_theme(self):
         self.theme_name = "dark" if self.theme_name == "light" else "light"
@@ -311,6 +339,53 @@ class ResSwitcherApp(tk.Tk):
                     widget.configure(bg=colors["bg"])
                 elif kind == "Canvas":
                     widget.configure(bg=colors["canvas_bg"])
+                elif kind == "Button":
+                    widget.configure(
+                        bg=colors["btn_bg"], fg=colors["btn_fg"],
+                        activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+                    )
+
+        if self.restore_banner is not None:
+            self.restore_banner.configure(
+                bg=colors["bg"], fg=colors["status_err"],
+                activebackground=colors["bg"], activeforeground=colors["status_err"]
+            )
+
+        if self.monitors_win is not None and self.monitors_win.winfo_exists():
+            self.monitors_win.configure(bg=colors["bg"])
+            for widget in self.monitors_themed_widgets:
+                if not widget.winfo_exists():
+                    continue
+                kind = widget.winfo_class()
+                if kind == "Frame":
+                    widget.configure(bg=colors["bg"])
+                elif kind == "Button":
+                    widget.configure(
+                        bg=colors["btn_bg"], fg=colors["btn_fg"],
+                        activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+                    )
+            # Status/name labels carry status-specific colors, so rebuild them
+            # fully against the new theme rather than trying to patch in place.
+            self._refresh_monitor_list()
+
+        if self.revert_win is not None and self.revert_win.winfo_exists():
+            self.revert_win.configure(bg=colors["bg"])
+            # The "Keep disabled"/"Revert now" buttons live inside a nested
+            # btn_frame (see _open_revert_dialog), not directly under
+            # revert_win, so a shallow winfo_children() misses them entirely
+            # — walk one level deeper for frames to actually reach them.
+            for widget in self.revert_win.winfo_children():
+                kind = widget.winfo_class()
+                if kind == "Label":
+                    widget.configure(bg=colors["bg"], fg=colors["fg"])
+                elif kind == "Frame":
+                    widget.configure(bg=colors["bg"])
+                    for child in widget.winfo_children():
+                        if child.winfo_class() == "Button":
+                            child.configure(
+                                bg=colors["btn_bg"], fg=colors["btn_fg"],
+                                activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+                            )
                 elif kind == "Button":
                     widget.configure(
                         bg=colors["btn_bg"], fg=colors["btn_fg"],
@@ -620,3 +695,589 @@ class ResSwitcherApp(tk.Tk):
         x = self.winfo_x()
         y = self.winfo_y()
         self.geometry(f"410x{new_h}+{x}+{y}")
+
+    # -- Monitor enable/disable -------------------------------------------------
+
+    def _check_pending_restore_on_startup(self):
+        pending = load_pending_restore()
+        if pending is None:
+            return
+        instance_id = pending.get("instance_id")
+        if not instance_id:
+            # Nothing actionable in this record — don't lock the UI or show
+            # a banner over a flag that can never be resolved either way.
+            clear_pending_restore()
+            return
+        self._active_pending_instance_id = instance_id
+        self._show_restore_banner()
+
+    def _show_restore_banner(self):
+        if self.restore_banner is None:
+            return
+        colors = THEMES[self.theme_name]
+        self.restore_banner.configure(
+            bg=colors["bg"], fg=colors["status_err"],
+            activebackground=colors["bg"], activeforeground=colors["status_err"]
+        )
+        self.restore_banner.pack_forget()
+        self.restore_banner.pack(after=self.status_label, pady=(6, 0), padx=10, fill="x")
+
+    def _hide_restore_banner(self):
+        if self.restore_banner is not None:
+            self.restore_banner.pack_forget()
+
+    def _restore_pending_from_banner(self):
+        # Reentrancy guard: without this, clicking the banner twice quickly
+        # (or once while an op from elsewhere is already running) could
+        # launch two elevated processes racing CM_Enable/CM_Disable calls
+        # against the same device.
+        if self._monitor_op_in_flight:
+            return
+        pending = load_pending_restore()
+        if pending is None:
+            self._hide_restore_banner()
+            return
+        instance_id = pending.get("instance_id")
+        friendly_name = pending.get("friendly_name", "the monitor")
+        if not instance_id:
+            clear_pending_restore()
+            self._hide_restore_banner()
+            return
+        self._hide_restore_banner()
+        self.status_label.config(fg=THEMES[self.theme_name]["fg"])
+        self.status_var.set(f"Restoring {friendly_name}...")
+        self._monitor_op_in_flight = True
+        self._run_threaded_monitor_op(
+            monitors_mod.enable_monitor, instance_id,
+            lambda ok, message: self._on_restore_complete(ok, message, friendly_name, instance_id)
+        )
+
+    def _on_restore_complete(self, ok, message, friendly_name, instance_id):
+        colors = THEMES[self.theme_name]
+        self._monitor_op_in_flight = False
+        if not ok and message == monitors_mod.TIMEOUT_MESSAGE:
+            # Genuinely unknown outcome, not a confirmed failure — the
+            # elevated process may still be waiting on a slow UAC prompt and
+            # could finish moments later, off in the background. Don't touch
+            # the recovery flag or the lock; leave it to a later check.
+            self.status_label.config(fg=colors["fg"])
+            self.status_var.set(
+                f"Still waiting on admin approval to restore {friendly_name} — "
+                f"check again in a moment."
+            )
+            if self.monitors_win is not None and self.monitors_win.winfo_exists():
+                self._refresh_monitor_list()
+            return
+        if not ok and message.startswith(monitors_mod.DEVICE_NOT_FOUND_PREFIX):
+            # The device is gone (unplugged/replaced) — nothing left to
+            # protect, so the flag is stale. Clear it instead of leaving the
+            # user stuck retrying a restore that can never succeed.
+            clear_pending_restore()
+            self._active_pending_instance_id = None
+            self._hide_restore_banner()
+            self.status_label.config(fg=colors["status_err"])
+            self.status_var.set(
+                f"{friendly_name} is no longer present on this system — cleared the stale recovery flag."
+            )
+            if self.monitors_win is not None and self.monitors_win.winfo_exists():
+                self._refresh_monitor_list()
+            return
+        status_text = f"Restored {friendly_name}"
+        if not ok:
+            # Same false-negative risk as the disable path, mirrored: a
+            # reported failure doesn't prove the re-enable didn't actually
+            # happen. Don't leave the "still disabled" banner up forever
+            # over a stale/unconfirmed result if the device is really back.
+            actual = self._find_monitor(instance_id)
+            if actual is not None and actual.is_enabled:
+                ok = True
+                status_text = f"Restored {friendly_name} (result was unconfirmed, verified by re-check)"
+        if ok:
+            clear_pending_restore()
+            self._active_pending_instance_id = None
+            self.status_label.config(fg=colors["status_ok"])
+            self.status_var.set(status_text)
+        else:
+            self._show_restore_banner()
+            self.status_label.config(fg=colors["status_err"])
+            self.status_var.set(
+                f"Failed to restore {friendly_name}: {message}. Please retry manually."
+            )
+        if self.monitors_win is not None and self.monitors_win.winfo_exists():
+            self._refresh_monitor_list()
+
+    def _run_threaded_monitor_op(self, op_func, instance_id, on_done):
+        def worker():
+            # Without this, an unexpected exception from op_func (a raw
+            # ctypes/OS call) would skip on_done entirely, leaving
+            # _monitor_op_in_flight/_active_pending_instance_id stuck set
+            # forever — every action button permanently disabled and the
+            # status label frozen on "Requesting admin approval..." with no
+            # way out short of restarting the app.
+            try:
+                ok, message = op_func(instance_id)
+            except Exception as e:
+                ok, message = False, f"Unexpected error: {e}"
+            try:
+                self.after(0, lambda: on_done(ok, message))
+            except Exception:
+                # Main window was closed while this op was still running.
+                # The elevated helper's real work (CM_Disable/Enable) has
+                # already happened regardless — pending_restore.json still
+                # correctly reflects reality on disk even though there's no
+                # UI left to update.
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_monitors(self):
+        if self.monitors_win is not None and self.monitors_win.winfo_exists():
+            self.monitors_win.lift()
+            self.monitors_win.focus_force()
+            return
+
+        colors = THEMES[self.theme_name]
+
+        win = tk.Toplevel(self)
+        win.title("Monitors")
+        win.resizable(False, False)
+        win.configure(bg=colors["bg"])
+        self.monitors_win = win
+        self.monitors_themed_widgets = []
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_monitors(win))
+
+        mw, mh = 380, 320
+        win.geometry(f"{mw}x{mh}")
+        win.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - (mw // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (mh // 2)
+        win.geometry(f"{mw}x{mh}+{x}+{y}")
+
+        self.monitors_list_frame = tk.Frame(win, bg=colors["bg"])
+        self.monitors_list_frame.pack(fill="both", expand=True, padx=14, pady=14)
+        self.monitors_themed_widgets.append(self.monitors_list_frame)
+
+        close_btn = tk.Button(
+            win, text="Close", command=lambda: self._close_monitors(win),
+            bg=colors["btn_bg"], fg=colors["btn_fg"],
+            activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+        )
+        close_btn.pack(side="bottom", pady=(0, 14))
+        self.monitors_themed_widgets.append(close_btn)
+
+        self._reconcile_stuck_pending()
+        self._refresh_monitor_list()
+
+    def _reconcile_stuck_pending(self):
+        # A disable that hit TIMEOUT_MESSAGE leaves _active_pending_instance_id
+        # set with no confirm/revert dialog driving it (we didn't know the
+        # outcome yet, so none was opened) — the UI stays locked until this
+        # resolves. By the time the user reopens Monitors, the elevated
+        # helper has almost certainly finished one way or the other, so
+        # re-check now instead of leaving them stuck until an app restart.
+        if self._active_pending_instance_id is None:
+            return
+        if self.revert_win is not None and self.revert_win.winfo_exists():
+            return  # a normal awaiting-confirmation dialog is already open
+        if self._monitor_op_in_flight:
+            return  # something is actively running right now, don't interfere
+
+        pending = load_pending_restore()
+        if pending is None:
+            self._active_pending_instance_id = None
+            return
+        instance_id = pending.get("instance_id")
+        friendly_name = pending.get("friendly_name", "the monitor")
+        if not instance_id:
+            clear_pending_restore()
+            self._active_pending_instance_id = None
+            return
+
+        actual = self._find_monitor(instance_id)
+        if actual is None:
+            return  # still can't confirm — stay locked, fail safe
+        if actual.is_enabled:
+            # Confirmed back on — nothing left to protect.
+            clear_pending_restore()
+            self._active_pending_instance_id = None
+        else:
+            # Confirmed disabled — resume the normal keep/revert flow instead
+            # of leaving it silently locked with no dialog to act on.
+            self._active_pending_instance_id = instance_id
+            self._open_revert_dialog(instance_id, friendly_name)
+
+    def _close_monitors(self, win):
+        self.monitors_win = None
+        self.monitors_themed_widgets = []
+        self.monitor_rows = {}
+        win.destroy()
+
+    def _refresh_monitor_list(self):
+        if self.monitors_win is None or not self.monitors_win.winfo_exists():
+            return
+
+        colors = THEMES[self.theme_name]
+
+        for child in self.monitors_list_frame.winfo_children():
+            child.destroy()
+        self.monitor_rows = {}
+
+        monitor_list = monitors_mod.enumerate_monitors()
+
+        if not monitor_list:
+            empty_label = tk.Label(
+                self.monitors_list_frame, text="No monitors found.",
+                bg=colors["bg"], fg=colors["fg"]
+            )
+            empty_label.pack(pady=8)
+            return
+
+        for mon in monitor_list:
+            row = tk.Frame(self.monitors_list_frame, bg=colors["bg"])
+            row.pack(fill="x", pady=4)
+
+            name_label = tk.Label(
+                row, text=mon.friendly_name, anchor="w",
+                wraplength=180, justify="left",
+                bg=colors["bg"], fg=colors["fg"]
+            )
+            name_label.pack(side="left", fill="x", expand=True)
+
+            status_text = "Enabled" if mon.is_enabled else "Disabled"
+            status_color = colors["status_ok"] if mon.is_enabled else colors["status_err"]
+            status_label = tk.Label(
+                row, text=status_text, width=8,
+                bg=colors["bg"], fg=status_color
+            )
+            status_label.pack(side="left", padx=(4, 4))
+
+            action_text = "Disable" if mon.is_enabled else "Enable"
+            locked = self._monitor_op_in_flight or self._active_pending_instance_id is not None
+            action_btn = tk.Button(
+                row, text=action_text, width=8,
+                bg=colors["btn_bg"], fg=colors["btn_fg"],
+                activebackground=colors["btn_active"], activeforeground=colors["btn_fg"],
+                state=tk.DISABLED if locked else tk.NORMAL,
+                command=lambda m=mon: self._on_monitor_action_click(m)
+            )
+            action_btn.pack(side="left")
+
+            self.monitor_rows[mon.instance_id] = row
+
+    def _on_monitor_action_click(self, monitor):
+        # Defensive: the row button is disabled while a op is in flight or a
+        # disable is awaiting confirmation, but guard here too in case a click
+        # slips in before the UI catches up (e.g. a queued event).
+        if self._monitor_op_in_flight or self._active_pending_instance_id is not None:
+            return
+
+        colors = THEMES[self.theme_name]
+        instance_id = monitor.instance_id
+        friendly_name = monitor.friendly_name
+
+        if monitor.is_enabled:
+            # Refuse to disable the only currently-enabled monitor: QuickRes
+            # is for turning off the *extra* monitor(s), not the one the
+            # user is actually looking at. Without this, disabling it blacks
+            # out the screen, and if the elevated call also happens to time
+            # out, there's no visible UI left to recover from.
+            other_enabled = [
+                m for m in monitors_mod.enumerate_monitors()
+                if m.is_enabled and m.instance_id != instance_id
+            ]
+            if not other_enabled:
+                self.status_label.config(fg=colors["status_err"])
+                self.status_var.set(
+                    f"Refusing to disable {friendly_name} — it's the only "
+                    f"enabled monitor. QuickRes is for disabling the extra "
+                    f"monitor(s), not your only display."
+                )
+                return
+            # Disabling is the risky direction: write the crash-recovery flag
+            # before we ever hand off to the elevated helper. If we can't
+            # persist that flag, the whole safety net is void, so refuse to
+            # disable rather than proceed unprotected.
+            if not save_pending_restore({
+                "instance_id": instance_id,
+                "friendly_name": friendly_name,
+                "action": "disable",
+                "started_at": time.time(),
+            }):
+                self.status_label.config(fg=colors["status_err"])
+                self.status_var.set(
+                    f"Could not write the crash-recovery flag — refusing to disable "
+                    f"{friendly_name}. Check disk space/permissions and try again."
+                )
+                return
+            self.status_var.set(f"Requesting admin approval to disable {friendly_name}...")
+            self.status_label.config(fg=colors["fg"])
+            self._monitor_op_in_flight = True
+            self._refresh_monitor_list()
+            self._run_threaded_monitor_op(
+                monitors_mod.disable_monitor, instance_id,
+                lambda ok, message: self._on_disable_complete(ok, message, monitor)
+            )
+        else:
+            self.status_var.set(f"Requesting admin approval to enable {friendly_name}...")
+            self.status_label.config(fg=colors["fg"])
+            self._monitor_op_in_flight = True
+            self._refresh_monitor_list()
+            self._run_threaded_monitor_op(
+                monitors_mod.enable_monitor, instance_id,
+                lambda ok, message: self._on_enable_complete(ok, message, monitor)
+            )
+
+    def _find_monitor(self, instance_id):
+        for mon in monitors_mod.enumerate_monitors():
+            if mon.instance_id == instance_id:
+                return mon
+        return None
+
+    def _on_disable_complete(self, ok, message, monitor):
+        colors = THEMES[self.theme_name]
+        self._monitor_op_in_flight = False
+        if not ok and message == monitors_mod.TIMEOUT_MESSAGE:
+            # Genuinely unknown outcome, not a confirmed failure — the
+            # elevated process may still be waiting on a slow UAC prompt and
+            # could disable the device moments later, off in the background.
+            # The recovery flag was already written before we started, so
+            # leave it exactly as-is (don't clear it, don't guess a verdict
+            # from an immediate re-check that would just see "not yet").
+            #
+            # Keep the lock on too: without this, _active_pending_instance_id
+            # stays None, _on_monitor_action_click's guard stops blocking,
+            # and the user could start disabling a SECOND monitor — whose
+            # save_pending_restore() call would overwrite this monitor's
+            # still-possibly-completing entry in the single-record
+            # pending_restore.json, silently losing its recovery flag.
+            self._active_pending_instance_id = monitor.instance_id
+            self.status_label.config(fg=colors["fg"])
+            self.status_var.set(
+                f"Still waiting on admin approval to disable {monitor.friendly_name} — "
+                f"reopen Monitors in a moment to see the real state."
+            )
+            self._refresh_monitor_list()
+            return
+        if not ok:
+            # A reported failure (its result file never got written) does
+            # NOT prove the disable didn't happen — the elevated process may
+            # have succeeded and just failed to report back. Re-check the
+            # real device state before ever clearing the crash-recovery flag
+            # on a false negative, which would otherwise strand a genuinely
+            # disabled monitor with no recovery flag and no restore banner.
+            actual = self._find_monitor(monitor.instance_id)
+            if actual is not None and not actual.is_enabled:
+                ok = True
+                message = f"{monitor.friendly_name} disabled (result was unconfirmed, verified by re-check)"
+        if ok:
+            # Stays locked (via _active_pending_instance_id) until the user
+            # confirms or the 10s auto-revert resolves it — only one risky
+            # pending action can be tracked at a time (pending_restore.json
+            # holds a single record), so no other monitor can be touched
+            # while this one is unresolved.
+            self._active_pending_instance_id = monitor.instance_id
+            self.status_label.config(fg=colors["status_ok"])
+            self.status_var.set(message)
+            self._refresh_monitor_list()
+            self._open_revert_dialog(monitor.instance_id, monitor.friendly_name)
+        else:
+            clear_pending_restore()
+            self.status_label.config(fg=colors["status_err"])
+            self.status_var.set(message)
+            self._refresh_monitor_list()
+
+    def _on_enable_complete(self, ok, message, monitor):
+        colors = THEMES[self.theme_name]
+        self._monitor_op_in_flight = False
+        if not ok and message == monitors_mod.TIMEOUT_MESSAGE:
+            # Same "genuinely unknown, not a confirmed failure" case as the
+            # other three completion handlers — don't render it as a plain
+            # failure (wrong color, misleading text). This direction never
+            # sets the pending-restore lock, so there's nothing else to do.
+            self.status_label.config(fg=colors["fg"])
+            self.status_var.set(
+                f"Still waiting on admin approval to enable {monitor.friendly_name} — "
+                f"check again in a moment."
+            )
+            self._refresh_monitor_list()
+            return
+        if not ok:
+            # Same false-negative risk as the other three completion
+            # handlers, mirrored here for message accuracy: a reported
+            # failure doesn't prove the enable didn't actually happen.
+            actual = self._find_monitor(monitor.instance_id)
+            if actual is not None and actual.is_enabled:
+                ok = True
+                message = f"{monitor.friendly_name} enabled (result was unconfirmed, verified by re-check)"
+        self.status_label.config(fg=colors["status_ok"] if ok else colors["status_err"])
+        self.status_var.set(message)
+        self._refresh_monitor_list()
+
+    def _open_revert_dialog(self, instance_id, friendly_name):
+        colors = THEMES[self.theme_name]
+
+        win = tk.Toplevel(self)
+        win.title("Keep this monitor disabled?")
+        win.resizable(False, False)
+        win.transient(self)
+        win.configure(bg=colors["bg"])
+        self.revert_win = win
+        # Dismissing via the titlebar X isn't a decision to "keep disabled" —
+        # treat it the same as clicking "Revert now" (the safe default),
+        # instead of leaving revert_win pointing at a destroyed widget while
+        # the countdown keeps running invisibly with no dialog left to act on.
+        win.protocol("WM_DELETE_WINDOW", lambda: self._revert_now(win, instance_id, friendly_name))
+
+        dw, dh = 300, 160
+        win.geometry(f"{dw}x{dh}")
+        win.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - (dw // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (dh // 2)
+        win.geometry(f"{dw}x{dh}+{x}+{y}")
+
+        countdown_var = tk.StringVar(value=f"Reverting in {10}s")
+        countdown_label = tk.Label(
+            win, textvariable=countdown_var, wraplength=260,
+            bg=colors["bg"], fg=colors["fg"]
+        )
+        countdown_label.pack(padx=16, pady=(16, 10))
+
+        remaining = {"seconds": 10}
+
+        def tick():
+            if self.revert_win is not win or not win.winfo_exists():
+                return
+            remaining["seconds"] -= 1
+            countdown_var.set(f"Reverting in {remaining['seconds']}s")
+            if remaining["seconds"] > 0:
+                self.after(1000, tick)
+
+        self.after(1000, tick)
+
+        guard = PendingDisableGuard(
+            revert_callback=lambda: self._start_revert(instance_id, friendly_name),
+            schedule_fn=lambda seconds, cb: self.after(int(seconds * 1000), cb),
+            cancel_fn=lambda handle: self.after_cancel(handle),
+            timeout_seconds=10,
+        )
+        self.pending_guard = guard
+        guard.start()
+
+        btn_frame = tk.Frame(win, bg=colors["bg"])
+        btn_frame.pack(pady=(0, 10))
+
+        btn_style = dict(
+            bg=colors["btn_bg"], fg=colors["btn_fg"],
+            activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+        )
+
+        tk.Button(
+            btn_frame, text="Keep disabled", width=13,
+            command=lambda: self._confirm_keep_disabled(win),
+            **btn_style
+        ).pack(side="left", padx=4)
+
+        tk.Button(
+            btn_frame, text="Revert now", width=13,
+            command=lambda: self._revert_now(win, instance_id, friendly_name),
+            **btn_style
+        ).pack(side="left", padx=4)
+
+    def _confirm_keep_disabled(self, win):
+        if self.pending_guard is not None:
+            self.pending_guard.confirm()
+            self.pending_guard = None
+        clear_pending_restore()
+        self._active_pending_instance_id = None
+        self._close_revert_dialog(win)
+        self._refresh_monitor_list()
+
+    def _revert_now(self, win, instance_id, friendly_name):
+        if self.pending_guard is not None:
+            # Stop the auto-revert timer so it doesn't fire a second time;
+            # the manual click below performs the same revert path instead.
+            self.pending_guard.confirm()
+            self.pending_guard = None
+        self._close_revert_dialog(win)
+        self._start_revert(instance_id, friendly_name)
+
+    def _close_revert_dialog(self, win):
+        if self.revert_win is win:
+            self.revert_win = None
+        if win.winfo_exists():
+            win.destroy()
+
+    def _start_revert(self, instance_id, friendly_name):
+        # The auto-revert timeout calls this directly (as PendingDisableGuard's
+        # revert_callback) without going through _revert_now, so the confirm
+        # dialog would otherwise stay on screen showing stale "Keep
+        # disabled"/"Revert now" choices after the monitor's already been
+        # re-enabled. Close it here too — idempotent when _revert_now already
+        # closed it.
+        if self.revert_win is not None:
+            self._close_revert_dialog(self.revert_win)
+
+        colors = THEMES[self.theme_name]
+        self.status_label.config(fg=colors["fg"])
+        self.status_var.set(f"Reverting {friendly_name}...")
+        self._monitor_op_in_flight = True
+        self._run_threaded_monitor_op(
+            monitors_mod.enable_monitor, instance_id,
+            lambda ok, message: self._on_revert_complete(ok, message, friendly_name, instance_id)
+        )
+
+    def _on_revert_complete(self, ok, message, friendly_name, instance_id):
+        colors = THEMES[self.theme_name]
+        self._monitor_op_in_flight = False
+        if not ok and message == monitors_mod.TIMEOUT_MESSAGE:
+            # Genuinely unknown outcome, not a confirmed failure — leave the
+            # recovery flag and lock exactly as they are and let a later
+            # check (reopening Monitors, or the startup banner) resolve it.
+            self.status_label.config(fg=colors["fg"])
+            self.status_var.set(
+                f"Still waiting on admin approval to revert {friendly_name} — "
+                f"check again in a moment."
+            )
+            if self.monitors_win is not None and self.monitors_win.winfo_exists():
+                self._refresh_monitor_list()
+            return
+        if not ok and message.startswith(monitors_mod.DEVICE_NOT_FOUND_PREFIX):
+            # The device is gone (unplugged/replaced) — nothing left to
+            # protect, so the flag is stale. Clear it instead of leaving the
+            # user stuck retrying a revert that can never succeed.
+            clear_pending_restore()
+            self._active_pending_instance_id = None
+            self._hide_restore_banner()
+            self.status_label.config(fg=colors["status_err"])
+            self.status_var.set(
+                f"{friendly_name} is no longer present on this system — cleared the stale recovery flag."
+            )
+            if self.monitors_win is not None and self.monitors_win.winfo_exists():
+                self._refresh_monitor_list()
+            return
+        status_text = f"Reverted {friendly_name}"
+        if not ok:
+            # Same false-negative risk as the disable path, mirrored: a
+            # reported failure doesn't prove the re-enable didn't actually
+            # happen — don't leave the monitor locked/the recovery flag set
+            # over a stale/unconfirmed result if it's really back on.
+            actual = self._find_monitor(instance_id)
+            if actual is not None and actual.is_enabled:
+                ok = True
+                status_text = f"Reverted {friendly_name} (result was unconfirmed, verified by re-check)"
+        if ok:
+            clear_pending_restore()
+            self._active_pending_instance_id = None
+            self.status_label.config(fg=colors["status_ok"])
+            self.status_var.set(status_text)
+        else:
+            # Leave the pending-restore flag AND the lock in place — the
+            # monitor is still in an unresolved, potentially-disabled state,
+            # so don't let the user start touching other monitors until this
+            # is resolved (via the startup/banner retry path).
+            self.status_label.config(fg=colors["status_err"])
+            self.status_var.set(
+                f"Failed to revert {friendly_name}: {message}. Please retry manually."
+            )
+            self._show_restore_banner()
+        if self.monitors_win is not None and self.monitors_win.winfo_exists():
+            self._refresh_monitor_list()
