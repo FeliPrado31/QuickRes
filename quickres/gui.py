@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from quickres.config import (
-    resource_path, load_config, save_config,
+    resource_path, load_config, update_config,
     save_pending_restore, load_pending_restore, clear_pending_restore,
 )
 from quickres.display import (
@@ -90,6 +90,8 @@ FAQ_ITEMS = [
     ),
 ]
 
+MAX_CUSTOM_RES = 6
+
 
 class ResSwitcherApp(tk.Tk):
     def __init__(self):
@@ -105,7 +107,7 @@ class ResSwitcherApp(tk.Tk):
             pass
 
         self.update_idletasks()
-        w, h = 410, 495
+        w, h = 410, 529
         x = (self.winfo_screenwidth() // 2) - (w // 2)
         y = (self.winfo_screenheight() // 2) - (h // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
@@ -156,6 +158,28 @@ class ResSwitcherApp(tk.Tk):
             btn.grid(row=row, column=col, padx=4, pady=4)
             self.themed_buttons.append(btn)
 
+        self.custom_label = tk.Label(self, text="Custom Resolution", font=("Segoe UI", 9, "bold"))
+        self.custom_label.pack(pady=(4, 4))
+        self.themed_labels.append(self.custom_label)
+
+        custom_row = tk.Frame(self)
+        custom_row.pack(pady=(0, 6))
+        self.themed_frames.append(custom_row)
+        self.custom_entry = tk.Entry(custom_row, width=14)
+        self.custom_entry.insert(0, "e.g. 1440x1080")
+        self.custom_entry.bind("<FocusIn>", self._clear_placeholder)
+        self.custom_entry.bind("<Return>", lambda e: self.apply_custom())
+        self.custom_entry.pack(side="left")
+        self.themed_entries.append(self.custom_entry)
+        custom_btn = tk.Button(custom_row, text="Apply", command=self.apply_custom)
+        custom_btn.pack(side="left", padx=(6, 0))
+        self.themed_buttons.append(custom_btn)
+
+        self.custom_grid = tk.Frame(self)
+        self.custom_grid.pack(pady=(0, 4))
+        self.themed_frames.append(self.custom_grid)
+        self.custom_buttons = []
+
         self.separator = ttk.Separator(self, orient="horizontal")
         self.separator.pack(fill="x", pady=10, padx=10)
 
@@ -201,10 +225,11 @@ class ResSwitcherApp(tk.Tk):
         self.themed_labels.append(native_label)
         saved_native = cfg.get("native_res", native_str)
         self.native_var = tk.StringVar(value=saved_native if saved_native in native_options else native_str)
-        ttk.Combobox(
+        self.native_combo = ttk.Combobox(
             native_row, textvariable=self.native_var, values=native_options,
-            width=11, state="readonly"
-        ).pack(side="left", padx=(6, 0))
+            width=11, state="normal"
+        )
+        self.native_combo.pack(side="left", padx=(6, 0))
 
         stretched_row = tk.Frame(self)
         stretched_row.pack(fill="x", padx=10, pady=(6, 0))
@@ -216,10 +241,11 @@ class ResSwitcherApp(tk.Tk):
         self.stretched_var = tk.StringVar(
             value=saved_stretched if saved_stretched in res_options else res_options[0]
         )
-        ttk.Combobox(
+        self.stretched_combo = ttk.Combobox(
             stretched_row, textvariable=self.stretched_var, values=res_options,
-            width=11, state="readonly"
-        ).pack(side="left", padx=(6, 0))
+            width=11, state="normal"
+        )
+        self.stretched_combo.pack(side="left", padx=(6, 0))
 
         self.status_var = tk.StringVar(value="")
         self.status_label = tk.Label(self, textvariable=self.status_var, wraplength=250, fg="green")
@@ -259,6 +285,8 @@ class ResSwitcherApp(tk.Tk):
         github_btn.pack(side="left", padx=4)
         self.themed_buttons.append(github_btn)
 
+        self._rebuild_custom_section()
+        self._sync_hotkey_dropdown_values()
         self.apply_theme()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, check_for_update)
@@ -477,7 +505,7 @@ class ResSwitcherApp(tk.Tk):
             self.status_var.set("Native/Stretched must look like 1920x1080")
             return
 
-        save_config({
+        update_config({
             "hotkey": self.hotkey_var.get(),
             "native_res": self.native_var.get(),
             "stretched_res": self.stretched_var.get()
@@ -576,12 +604,97 @@ class ResSwitcherApp(tk.Tk):
     def apply_custom(self):
         colors = THEMES[self.theme_name]
         text = self.custom_entry.get().strip()
-        match = re.match(r"^(\d{2,5})\s*[x, ]\s*(\d{2,5})$", text)
-        if not match:
+        parsed = self._parse_res(text)
+        if not parsed:
             self.status_label.config(fg=colors["status_err"])
             self.status_var.set("Format like 1440x1080")
             return
-        self.apply_resolution(int(match.group(1)), int(match.group(2)))
+
+        width, height = parsed
+        res_str = f"{width}x{height}"
+        preset_strs = {f"{w}x{h}" for _, w, h in QUICK_LIST}
+
+        if res_str not in preset_strs:
+            cfg = load_config()
+            customs = cfg.get("custom_resolutions", [])
+            if res_str in customs:
+                customs.remove(res_str)
+            customs.append(res_str)
+            if len(customs) > MAX_CUSTOM_RES:
+                customs = customs[-MAX_CUSTOM_RES:]
+            update_config({"custom_resolutions": customs})
+            self._rebuild_custom_section()
+            self._sync_hotkey_dropdown_values()
+
+        self.custom_entry.delete(0, "end")
+        self.apply_resolution(width, height)
+
+    def _rebuild_custom_section(self):
+        for btn in self.custom_buttons:
+            if btn in self.themed_buttons:
+                self.themed_buttons.remove(btn)
+            btn.destroy()
+        self.custom_buttons = []
+
+        cfg = load_config()
+        customs = cfg.get("custom_resolutions", [])
+        colors = THEMES[self.theme_name]
+
+        for i, res_str in enumerate(customs):
+            w_str, h_str = res_str.split("x")
+            row, col = divmod(i, 2)
+            btn = tk.Button(
+                self.custom_grid, text=res_str, width=13,
+                command=lambda w=int(w_str), h=int(h_str): self.apply_resolution(w, h),
+                bg=colors["btn_bg"], fg=colors["btn_fg"],
+                activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+            )
+            btn.bind("<Button-3>", lambda e, r=res_str: self._remove_custom(r))
+            btn.grid(row=row, column=col, padx=4, pady=4)
+            self.themed_buttons.append(btn)
+            self.custom_buttons.append(btn)
+
+        self._resize_for_custom(len(customs))
+
+    def _remove_custom(self, res_str):
+        cfg = load_config()
+        customs = cfg.get("custom_resolutions", [])
+        if res_str in customs:
+            customs.remove(res_str)
+            update_config({"custom_resolutions": customs})
+        self._rebuild_custom_section()
+        self._sync_hotkey_dropdown_values()
+        self.status_label.config(fg=THEMES[self.theme_name]["status_ok"])
+        self.status_var.set(f"Removed {res_str} from custom list")
+
+    def _sync_hotkey_dropdown_values(self):
+        cfg = load_config()
+        customs = cfg.get("custom_resolutions", [])
+
+        merged = [f"{w}x{h}" for _, w, h in QUICK_LIST]
+        for c in customs:
+            if c not in merged:
+                merged.append(c)
+
+        native_opts = list(merged)
+        detected_native = get_current_resolution()
+        if detected_native:
+            native_str = f"{detected_native[0]}x{detected_native[1]}"
+            if native_str not in native_opts:
+                native_opts.insert(0, native_str)
+
+        self.native_combo["values"] = native_opts
+        self.stretched_combo["values"] = merged
+
+    def _resize_for_custom(self, count):
+        extra = 0
+        if count:
+            rows = (count + 1) // 2
+            extra = 30 + rows * 42
+        new_h = 529 + extra
+        x = self.winfo_x()
+        y = self.winfo_y()
+        self.geometry(f"410x{new_h}+{x}+{y}")
 
     # -- Monitor enable/disable -------------------------------------------------
 

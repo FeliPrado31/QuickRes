@@ -61,6 +61,13 @@ def save_config(config_dict: dict):
         pass
 
 
+def update_config(updates: dict):
+    cfg = load_config()
+    cfg.update(updates)
+    save_config(cfg)
+    return cfg
+
+
 def save_pending_restore(data: dict) -> bool:
     """Write the crash-recovery flag. Callers MUST check the return value:
     this flag is the only thing that lets QuickRes detect and offer recovery

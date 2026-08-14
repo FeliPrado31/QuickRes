@@ -35,6 +35,7 @@ class DEVMODE(ctypes.Structure):
 
 DM_PELSWIDTH = 0x80000
 DM_PELSHEIGHT = 0x100000
+DM_DISPLAYFREQUENCY = 0x400000
 
 CDS_UPDATEREGISTRY = 0x00000001
 CDS_NORESET = 0x10000000
@@ -82,13 +83,29 @@ def get_supported_resolutions() -> set:
 def set_resolution(width: int, height: int) -> tuple[bool, str]:
     devmode = DEVMODE()
     devmode.dmSize = ctypes.sizeof(DEVMODE)
+
+    has_refresh_rate = bool(
+        user32.EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ctypes.byref(devmode))
+        and devmode.dmDisplayFrequency > 0
+    )
+    refresh_rate = devmode.dmDisplayFrequency if has_refresh_rate else 0
+
     devmode.dmPelsWidth = width
     devmode.dmPelsHeight = height
     devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
+    if has_refresh_rate:
+        devmode.dmDisplayFrequency = refresh_rate
+        devmode.dmFields |= DM_DISPLAYFREQUENCY
 
     result = user32.ChangeDisplaySettingsW(
         ctypes.byref(devmode), CDS_UPDATEREGISTRY | CDS_NORESET
     )
+
+    if result != 0 and has_refresh_rate:
+        devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
+        result = user32.ChangeDisplaySettingsW(
+            ctypes.byref(devmode), CDS_UPDATEREGISTRY | CDS_NORESET
+        )
 
     if result != 0:
         return False, (f"Error code {result}. Try running as Administrator, "
