@@ -3,7 +3,6 @@ import os
 import subprocess
 import sys
 import urllib.request
-from tkinter import messagebox
 
 from quickres import __version__, UPDATE_URL
 
@@ -15,48 +14,6 @@ def fetch_version_info():
     )
     with urllib.request.urlopen(request, timeout=5) as resp:
         return json.loads(resp.read().decode())
-
-
-def check_for_update(manual=False):
-    if not getattr(sys, "frozen", False):
-        if manual:
-            messagebox.showinfo("Check for updates", "Update checks only run in the built exe.")
-        return
-
-    try:
-        data = fetch_version_info()
-    except Exception as e:
-        if manual:
-            messagebox.showerror("Check for updates", f"Could not reach the update server.\n\n{e}")
-        return
-
-    latest_version = data.get("version", "")
-    download_url = data.get("url", "")
-    if not latest_version or not download_url:
-        if manual:
-            messagebox.showerror("Check for updates", "Update server returned bad data.")
-        return
-
-    def version_tuple(v):
-        return tuple(int(p) for p in v.split("."))
-
-    try:
-        is_newer = version_tuple(latest_version) > version_tuple(__version__)
-    except ValueError:
-        if manual:
-            messagebox.showerror("Check for updates", "Update server returned bad data.")
-        return
-
-    if not is_newer:
-        if manual:
-            messagebox.showinfo("Check for updates", f"You're up to date ({__version__}).")
-        return
-
-    if messagebox.askyesno(
-        "Update available",
-        f"QuickRes {latest_version} is available (you have {__version__}).\n\nUpdate now?"
-    ):
-        apply_update(download_url)
 
 
 def apply_update(download_url):
@@ -74,9 +31,8 @@ def apply_update(download_url):
         )
         with urllib.request.urlopen(request, timeout=30) as resp, open(new_exe_path, "wb") as out_file:
             out_file.write(resp.read())
-    except Exception:
-        messagebox.showerror("Update failed", "Could not download the update. Try again later.")
-        return
+    except Exception as e:
+        raise RuntimeError("Could not download the update. Try again later.") from e
 
     bat_contents = (
         "@echo off\n"

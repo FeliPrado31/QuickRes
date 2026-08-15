@@ -68,13 +68,15 @@ def _ratio_label(w, h):
 
 
 def _classify(w, h, native):
-    if native and (w, h) == native:
+    if not native:
+        return "Preset"
+    if (w, h) == native:
         return "Native"
-    if native and h == native[1] and w < native[0]:
+    if h == native[1] and w < native[0]:
         return "Stretched"
-    if native and w * h < 0.6 * native[0] * native[1]:
+    if w * h < 0.6 * native[0] * native[1]:
         return "Low"
-    if native and w > native[0]:
+    if w > native[0]:
         return "Wide"
     return "Stretched"
 
@@ -116,6 +118,13 @@ class Api:
         self._monitor_op_in_flight = False
         self._active_pending_instance_id = None
         self._confirm_dialog_instance_id = None
+        self._pending_disable_started_at = None
+        # pywebview dispatches concurrent js_api calls on separate threads
+        # (unlike the original single-threaded Tkinter callback model), so
+        # the monitor lock's check-then-set and the hotkey start/stop guard
+        # both need real mutual exclusion, not just a plain bool flag.
+        self._monitor_lock = threading.Lock()
+        self._hotkey_lock = threading.Lock()
 
     def bind_window(self, window):
         _window_holder["window"] = window
@@ -230,25 +239,37 @@ class Api:
 
     # ---- hotkey ----
     def start_hotkey(self, key, native, stretched):
-        native_t = _parse_res(native)
-        stretched_t = _parse_res(stretched)
-        if not native_t or not stretched_t:
-            return {"ok": False, "message": "Native/Stretched must look like 1920x1080"}
-        update_config({"hotkey": key, "native_res": native, "stretched_res": stretched})
-        self.hotkey_toggle = HotkeyToggle(
-            key_name=key, native_res=native_t, stretched_res=stretched_t,
-            on_status=self._push_status,
-        )
-        self.hotkey_toggle.start()
-        self.hotkey_running = True
-        return {"ok": True}
+        # Guards against a fast double-click (or a genuine concurrent call,
+        # since pywebview dispatches js_api calls on separate threads)
+        # overwriting self.hotkey_toggle before the first instance is ever
+        # stopped, leaking its registered hotkey and message-loop thread.
+        if not self._hotkey_lock.acquire(blocking=False):
+            return {"ok": False, "message": "Hotkey is already starting/stopping."}
+        try:
+            if self.hotkey_running:
+                return {"ok": False, "message": "Hotkey is already running."}
+            native_t = _parse_res(native)
+            stretched_t = _parse_res(stretched)
+            if not native_t or not stretched_t:
+                return {"ok": False, "message": "Native/Stretched must look like 1920x1080"}
+            update_config({"hotkey": key, "native_res": native, "stretched_res": stretched})
+            self.hotkey_toggle = HotkeyToggle(
+                key_name=key, native_res=native_t, stretched_res=stretched_t,
+                on_status=self._push_status,
+            )
+            self.hotkey_toggle.start()
+            self.hotkey_running = True
+            return {"ok": True}
+        finally:
+            self._hotkey_lock.release()
 
     def stop_hotkey(self):
-        if self.hotkey_toggle:
-            if self.hotkey_toggle.is_stretched:
-                set_resolution(*self.hotkey_toggle.native_res)
-            self.hotkey_toggle.stop()
-        self.hotkey_running = False
+        with self._hotkey_lock:
+            if self.hotkey_toggle:
+                if self.hotkey_toggle.is_stretched:
+                    set_resolution(*self.hotkey_toggle.native_res)
+                self.hotkey_toggle.stop()
+            self.hotkey_running = False
         return {"ok": True}
 
     # ---- updates ----
@@ -315,6 +336,7 @@ class Api:
             cancel_fn=_cancel,
             timeout_seconds=REVERT_TIMEOUT_SECONDS,
         )
+        self._pending_disable_started_at = time.time()
         self.pending_guard.start()
 
     def _auto_revert(self, instance_id, friendly_name):
@@ -340,32 +362,48 @@ class Api:
             return  # already a normal, resolved confirm state
         if self._monitor_op_in_flight:
             return
+        if not self._monitor_lock.acquire(blocking=False):
+            return  # a monitor_action() call is mid-flight; try again next list_monitors()
 
-        pending = load_pending_restore()
-        if pending is None:
-            self._active_pending_instance_id = None
-            return
-        instance_id = pending.get("instance_id")
-        friendly_name = pending.get("friendly_name", "the monitor")
-        if not instance_id:
-            clear_pending_restore()
-            self._active_pending_instance_id = None
-            return
+        try:
+            pending = load_pending_restore()
+            if pending is None:
+                self._active_pending_instance_id = None
+                return
+            instance_id = pending.get("instance_id")
+            friendly_name = pending.get("friendly_name", "the monitor")
+            if not instance_id:
+                clear_pending_restore()
+                self._active_pending_instance_id = None
+                return
 
-        actual = self._find_monitor(instance_id)
-        if actual is None:
-            return  # still can't confirm — stay locked, fail safe
-        if actual.is_enabled:
-            clear_pending_restore()
-            self._active_pending_instance_id = None
-        else:
-            self._active_pending_instance_id = instance_id
-            self._confirm_dialog_instance_id = instance_id
-            self._start_revert_guard(instance_id, friendly_name)
+            actual = self._find_monitor(instance_id)
+            if actual is None:
+                return  # still can't confirm — stay locked, fail safe
+            if actual.is_enabled:
+                clear_pending_restore()
+                self._active_pending_instance_id = None
+            else:
+                self._active_pending_instance_id = instance_id
+                self._confirm_dialog_instance_id = instance_id
+                self._start_revert_guard(instance_id, friendly_name)
+        finally:
+            self._monitor_lock.release()
 
     def list_monitors(self):
         self._reconcile_stuck_pending()
         monitors = monitors_mod.enumerate_monitors()
+
+        countdown = REVERT_TIMEOUT_SECONDS
+        if self._confirm_dialog_instance_id is not None and self._pending_disable_started_at is not None:
+            # Report the guard's actual remaining time, not a fresh 10s —
+            # otherwise reopening Monitors mid-countdown resets the visible
+            # timer while the real PendingDisableGuard keeps running from
+            # wherever it actually was, and the monitor can auto-revert
+            # while the UI still shows several seconds left.
+            elapsed = time.time() - self._pending_disable_started_at
+            countdown = max(0, round(REVERT_TIMEOUT_SECONDS - elapsed))
+
         return {
             "monitors": [
                 {
@@ -378,56 +416,68 @@ class Api:
             ],
             "op_in_flight": self._monitor_op_in_flight or self._active_pending_instance_id is not None,
             "confirming_instance_id": self._confirm_dialog_instance_id,
-            "countdown": REVERT_TIMEOUT_SECONDS,
+            "countdown": countdown,
         }
 
     def monitor_action(self, instance_id):
-        if self._monitor_op_in_flight or self._active_pending_instance_id is not None:
+        # pywebview can dispatch two rapid clicks as concurrent js_api calls
+        # on separate threads, and a plain in-flight bool has a TOCTOU gap
+        # between reading and setting it — a non-blocking lock acquire makes
+        # the check-and-claim atomic instead, so two concurrent calls can
+        # never both slip past the guard and launch overlapping elevated
+        # disable/enable operations racing on the single-record
+        # pending_restore.json.
+        if not self._monitor_lock.acquire(blocking=False):
             return {"ok": False, "kind": "err", "message": "Another monitor operation is already in progress."}
+        try:
+            if self._monitor_op_in_flight or self._active_pending_instance_id is not None:
+                return {"ok": False, "kind": "err", "message": "Another monitor operation is already in progress."}
 
-        monitor = self._find_monitor(instance_id)
-        if monitor is None:
-            return {"ok": False, "kind": "err", "message": "Monitor no longer found."}
+            monitor = self._find_monitor(instance_id)
+            if monitor is None:
+                return {"ok": False, "kind": "err", "message": "Monitor no longer found."}
 
-        if monitor.is_enabled:
-            # Refuse to disable the only currently-enabled monitor — QuickRes
-            # is for turning off the *extra* monitor(s), not the one the
-            # user is actually looking at.
-            other_enabled = [
-                m for m in monitors_mod.enumerate_monitors()
-                if m.is_enabled and m.instance_id != instance_id
-            ]
-            if not other_enabled:
-                return {"ok": False, "kind": "err", "message": (
-                    f"Refusing to disable {monitor.friendly_name} — it's the only "
-                    f"enabled monitor. QuickRes is for disabling the extra "
-                    f"monitor(s), not your only display."
-                )}
-            # Disabling is the risky direction: write the crash-recovery flag
-            # before ever handing off to the elevated helper.
-            if not save_pending_restore({
-                "instance_id": instance_id,
-                "friendly_name": monitor.friendly_name,
-                "action": "disable",
-                "started_at": time.time(),
-            }):
-                return {"ok": False, "kind": "err", "message": (
-                    f"Could not write the crash-recovery flag — refusing to disable "
-                    f"{monitor.friendly_name}. Check disk space/permissions and try again."
-                )}
-            self._monitor_op_in_flight = True
-            try:
-                ok, message = monitors_mod.disable_monitor(instance_id)
-            except Exception as e:
-                ok, message = False, f"Unexpected error: {e}"
-            return self._finish_disable(ok, message, monitor)
-        else:
-            self._monitor_op_in_flight = True
-            try:
-                ok, message = monitors_mod.enable_monitor(instance_id)
-            except Exception as e:
-                ok, message = False, f"Unexpected error: {e}"
-            return self._finish_enable(ok, message, monitor)
+            if monitor.is_enabled:
+                # Refuse to disable the only currently-enabled monitor —
+                # QuickRes is for turning off the *extra* monitor(s), not
+                # the one the user is actually looking at.
+                other_enabled = [
+                    m for m in monitors_mod.enumerate_monitors()
+                    if m.is_enabled and m.instance_id != instance_id
+                ]
+                if not other_enabled:
+                    return {"ok": False, "kind": "err", "message": (
+                        f"Refusing to disable {monitor.friendly_name} — it's the only "
+                        f"enabled monitor. QuickRes is for disabling the extra "
+                        f"monitor(s), not your only display."
+                    )}
+                # Disabling is the risky direction: write the crash-recovery
+                # flag before ever handing off to the elevated helper.
+                if not save_pending_restore({
+                    "instance_id": instance_id,
+                    "friendly_name": monitor.friendly_name,
+                    "action": "disable",
+                    "started_at": time.time(),
+                }):
+                    return {"ok": False, "kind": "err", "message": (
+                        f"Could not write the crash-recovery flag — refusing to disable "
+                        f"{monitor.friendly_name}. Check disk space/permissions and try again."
+                    )}
+                self._monitor_op_in_flight = True
+                try:
+                    ok, message = monitors_mod.disable_monitor(instance_id)
+                except Exception as e:
+                    ok, message = False, f"Unexpected error: {e}"
+                return self._finish_disable(ok, message, monitor)
+            else:
+                self._monitor_op_in_flight = True
+                try:
+                    ok, message = monitors_mod.enable_monitor(instance_id)
+                except Exception as e:
+                    ok, message = False, f"Unexpected error: {e}"
+                return self._finish_enable(ok, message, monitor)
+        finally:
+            self._monitor_lock.release()
 
     def _finish_disable(self, ok, message, monitor):
         self._monitor_op_in_flight = False

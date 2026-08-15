@@ -22,7 +22,7 @@ def test_round_trip(monkeypatch, tmp_path):
 
 
 def test_save_returns_false_on_write_failure(monkeypatch, tmp_path):
-    # Callers (gui.py) rely on this return value to refuse a disable action
+    # Callers (webview/bridge.py) rely on this return value to refuse a disable action
     # when the crash-recovery flag can't be persisted — the safety net is
     # void otherwise, so this must surface as False, not a swallowed error.
     _use_tmp_paths(monkeypatch, tmp_path)

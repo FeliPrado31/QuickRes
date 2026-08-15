@@ -519,17 +519,18 @@ input:focus,select:focus{outline:none;border-color:var(--ac)}
           refreshMonitors();
         });
       });
-      els("qrRevertNow").addEventListener("click", () => {
-        if (!api()) return;
-        const id = state.confirmInstanceId;
-        stopCountdown();
-        state.confirmInstanceId = null;
-        api().revert_now(id).then(result => {
-          pushStatus(result.message, result.kind || (result.ok ? "ok" : "err"));
-          refreshMonitors();
-        });
-      });
+      els("qrRevertNow").addEventListener("click", () => performRevertNow(state.confirmInstanceId));
     }
+  }
+
+  function performRevertNow(id) {
+    if (!api() || id == null) return;
+    stopCountdown();
+    state.confirmInstanceId = null;
+    api().revert_now(id).then(result => {
+      pushStatus(result.message, result.kind || (result.ok ? "ok" : "err"));
+      refreshMonitors();
+    });
   }
 
   function startCountdown(seconds) {
@@ -571,6 +572,26 @@ input:focus,select:focus{outline:none;border-color:var(--ac)}
     });
   }
 
+  // ---- updates ----
+  function runUpdateCheck(auto) {
+    if (!api()) return;
+    api().check_updates().then(result => {
+      if (result.kind === "available") {
+        if (confirm(result.message + "\n\nUpdate now?")) {
+          pushStatus("Downloading update...", "idle");
+          api().confirm_update(result.url);
+        }
+        return;
+      }
+      // The automatic startup check (old Tkinter build did this via
+      // self.after(500, check_for_update)) should only speak up when
+      // there's actually something to report — an "up to date"/idle
+      // status on every launch is just noise nobody asked for.
+      if (auto && (result.kind === "ok" || result.kind === "idle")) return;
+      pushStatus(result.message, result.kind || "idle");
+    });
+  }
+
   // ---- resolution not found ----
   function openNotFound(width, height, vendors) {
     const res = width + "x" + height;
@@ -593,6 +614,13 @@ input:focus,select:focus{outline:none;border-color:var(--ac)}
   // ---- modal plumbing ----
   function show(id) { els(id).style.display = "flex"; }
   function closeModals() {
+    // A monitor disable awaiting keep/revert confirmation can't be silently
+    // dismissed — mirrors the old Tkinter build's WM_DELETE_WINDOW handler,
+    // which always treated closing the window mid-confirm as "revert now"
+    // instead of just hiding the dialog while the risky state persisted.
+    if (state.confirmInstanceId != null) {
+      performRevertNow(state.confirmInstanceId);
+    }
     ["qrFaqOverlay", "qrMonitorsOverlay", "qrNotFoundOverlay"].forEach(id => els(id).style.display = "none");
   }
 
@@ -621,19 +649,7 @@ input:focus,select:focus{outline:none;border-color:var(--ac)}
     els("qrHotkeyRun").addEventListener("click", toggleHotkeyRun);
     els("qrOpenFaq").addEventListener("click", openFaq);
     els("qrOpenMonitors").addEventListener("click", openMonitors);
-    els("qrCheckUpdates").addEventListener("click", () => {
-      if (!api()) return;
-      api().check_updates().then(result => {
-        if (result.kind === "available") {
-          if (confirm(result.message + "\n\nUpdate now?")) {
-            pushStatus("Downloading update...", "idle");
-            api().confirm_update(result.url);
-          }
-          return;
-        }
-        pushStatus(result.message, result.kind || "idle");
-      });
-    });
+    els("qrCheckUpdates").addEventListener("click", () => runUpdateCheck(false));
     els("qrMonitorNotice").addEventListener("click", () => {
       if (!api()) return;
       pushStatus("Restoring...", "idle");
@@ -667,6 +683,7 @@ input:focus,select:focus{outline:none;border-color:var(--ac)}
     setHotkeyUi(false);
     renderMonitorNotice(initial.monitorNotice);
     wire();
+    setTimeout(() => runUpdateCheck(true), 500);
   }
 
   let booted = false;
