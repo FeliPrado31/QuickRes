@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 from quickres import display
 
-
 class FakeUser32:
     def __init__(self, *, refresh_rate=0, enum_result=True, change_results=(0, 0)):
         self.refresh_rate = refresh_rate

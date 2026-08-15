@@ -23,6 +23,11 @@ from quickres.updater import check_for_update
 from quickres.hotkey import HotkeyToggle, HOTKEY_OPTIONS
 from quickres import monitors as monitors_mod
 from quickres.monitors import PendingDisableGuard
+from quickres import __version__
+from quickres import i18n
+from quickres.i18n import t
+
+QUICKRES_WEBSITE = "https://quickres.online/"
 
 THEMES = {
     "light": {
@@ -53,42 +58,17 @@ THEMES = {
     },
 }
 
-FAQ_ITEMS = [
-    (
-        "Why does it say \"Resolution not found\"?",
-        "QuickRes checks your GPU driver's list of registered resolutions "
-        "before switching. If a resolution isn't on that list, Windows has "
-        "no way to switch to it yet.\n\n"
-        "When this happens, QuickRes shows a popup with a button for your "
-        "graphics software (NVIDIA Control Panel, AMD Software, or Intel "
-        "Graphics Software, based on what's actually detected in your PC). "
-        "Click it, then add the resolution as a custom resolution there:\n\n"
-        "NVIDIA: Display > Change Resolution > Customize >"
-        "Create Custom Resolution\n\n"
-        "AMD: Display > Custom Resolutions > Create New\n\n"
-        "Intel: Display > General > Resolution > + (create custom profile)"
-    ),
-    (
-        "Nothing happens when I click a button?",
-        "Try running QuickRes as Administrator."
-    ),
-    (
-        "Screen looks wrong after switching? (valorant)",
-        "Make sure Valorant is on the fill/agent select screen before you "
-        "switch to a stretched res. You have to do this every match, since "
-        "loading into a new game resets your resolution and switching too "
-        "early will give you black bars. Set a hotkey below so you can "
-        "toggle between native and stretched with one keypress instead of "
-        "clicking through the app."
-    ),
-    (
-        "What does the hotkey do?",
-        "Once you press Start Hotkey, the key you picked toggles your "
-        "display between the Native and Stretched resolutions set above. "
-        "Press it once on the fill/agent select screen to go stretched, "
-        "press it again after the match to go back to native.\n\n"
-    ),
+FAQ_KEYS = [
+    ("faq_q1", "faq_a1"),
+    ("faq_q2", "faq_a2"),
+    ("faq_q3", "faq_a3"),
+    ("faq_q4", "faq_a4"),
 ]
+
+
+def _faq_items():
+    return [(t(q_key), t(a_key)) for q_key, a_key in FAQ_KEYS]
+
 
 MAX_CUSTOM_RES = 6
 
@@ -97,7 +77,6 @@ class ResSwitcherApp(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("QuickRes")
         self.resizable(False, False)
 
         try:
@@ -105,7 +84,14 @@ class ResSwitcherApp(tk.Tk):
         except Exception:
             pass
 
-        self.theme_name = "light"
+        cfg = load_config()
+
+        self.language_setting = cfg.get("language", "auto")
+        i18n.set_language(i18n.resolve_language(self.language_setting))
+
+        self.title(t("app_title"))
+
+        self.theme_name = cfg.get("theme") if cfg.get("theme") in THEMES else "light"
         self.themed_frames = []
         self.themed_labels = []
         self.themed_buttons = []
@@ -120,29 +106,43 @@ class ResSwitcherApp(tk.Tk):
         self.monitors_win = None
         self.monitors_themed_widgets = []
         self.monitor_rows = {}
+
+        self.settings_win = None
+        self.settings_themed_widgets = []
+        self.theme_btn = None
+
         self.pending_guard = None
         self.revert_win = None
         self._monitor_op_in_flight = False
         self._active_pending_instance_id = None
         self.restore_banner = None
 
+        title_row = tk.Frame(self)
+        title_row.pack(pady=(12, 8))
+        self.themed_frames.append(title_row)
+
         title_label = tk.Label(
-            self, text="QuickRes",
+            title_row, text=t("app_title"),
             font=("Segoe UI", 12, "bold", "underline"),
             cursor="hand2"
         )
-        title_label.pack(pady=(12, 8))
-        title_label.bind("<Button-1>", lambda e: webbrowser.open("https://lxzy.my/"))
+        title_label.pack(side="left")
+        title_label.bind("<Button-1>", lambda e: webbrowser.open(QUICKRES_WEBSITE))
         self.title_label = title_label
+
+        version_label = tk.Label(
+            title_row, text=f"v{__version__}",
+            font=("Segoe UI", 8),
+            cursor="hand2"
+        )
+        version_label.pack(side="left", padx=(5, 0), anchor="s", pady=(0, 2))
+        version_label.bind("<Button-1>", lambda e: webbrowser.open(QUICKRES_WEBSITE))
+        self.themed_labels.append(version_label)
+        self.version_label = version_label
 
         self.supported_resolutions = get_supported_resolutions()
         self.gpu_vendors = None
 
-        # Scrollable area: holds the quick-resolution grid and the custom
-        # resolutions list, the two things that grow over time. Everything
-        # below it (hotkey setup, FAQ/Monitors/theme/etc.) is packed
-        # directly on the window instead, so that growth can never push
-        # those controls outside the visible window again.
         scroll_outer = tk.Frame(self)
         scroll_outer.pack(fill="both", expand=True)
         self.themed_frames.append(scroll_outer)
@@ -184,7 +184,7 @@ class ResSwitcherApp(tk.Tk):
             btn.grid(row=row, column=col, padx=4, pady=4)
             self.themed_buttons.append(btn)
 
-        self.custom_label = tk.Label(scroll_content, text="Custom Resolution", font=("Segoe UI", 9, "bold"))
+        self.custom_label = tk.Label(scroll_content, text=t("custom_resolution_label"), font=("Segoe UI", 9, "bold"))
         self.custom_label.pack(pady=(4, 4))
         self.themed_labels.append(self.custom_label)
 
@@ -192,12 +192,12 @@ class ResSwitcherApp(tk.Tk):
         custom_row.pack(pady=(0, 6))
         self.themed_frames.append(custom_row)
         self.custom_entry = tk.Entry(custom_row, width=14)
-        self.custom_entry.insert(0, "e.g. 1440x1080")
+        self.custom_entry.insert(0, t("custom_res_placeholder"))
         self.custom_entry.bind("<FocusIn>", self._clear_placeholder)
         self.custom_entry.bind("<Return>", lambda e: self.apply_custom())
         self.custom_entry.pack(side="left")
         self.themed_entries.append(self.custom_entry)
-        custom_btn = tk.Button(custom_row, text="Apply", command=self.apply_custom)
+        custom_btn = tk.Button(custom_row, text=t("btn_apply"), command=self.apply_custom)
         custom_btn.pack(side="left", padx=(6, 0))
         self.themed_buttons.append(custom_btn)
 
@@ -206,9 +206,6 @@ class ResSwitcherApp(tk.Tk):
         self.themed_frames.append(self.custom_grid)
         self.custom_buttons = []
 
-        # Footer: always packed directly on the window (never inside the
-        # scrollable area), so it stays visible no matter how long the
-        # quick-resolution or custom-resolution lists grow.
         footer_frame = tk.Frame(self)
         footer_frame.pack(side="bottom", fill="x")
         self.themed_frames.append(footer_frame)
@@ -216,16 +213,14 @@ class ResSwitcherApp(tk.Tk):
         self.separator = ttk.Separator(footer_frame, orient="horizontal")
         self.separator.pack(fill="x", pady=10, padx=10)
 
-        hotkey_title = tk.Label(footer_frame, text="Hotkey Toggle", font=("Segoe UI", 9, "bold"))
+        hotkey_title = tk.Label(footer_frame, text=t("hotkey_toggle_label"), font=("Segoe UI", 9, "bold"))
         hotkey_title.pack(anchor="w", padx=10)
         self.themed_labels.append(hotkey_title)
-
-        cfg = load_config()
 
         hotkey_row = tk.Frame(footer_frame)
         hotkey_row.pack(fill="x", padx=10, pady=(4, 0))
         self.themed_frames.append(hotkey_row)
-        hotkey_label = tk.Label(hotkey_row, text="Hotkey:")
+        hotkey_label = tk.Label(hotkey_row, text=t("hotkey_label"))
         hotkey_label.pack(side="left")
         self.themed_labels.append(hotkey_label)
         saved_hotkey = cfg.get("hotkey", "F6")
@@ -235,7 +230,7 @@ class ResSwitcherApp(tk.Tk):
             width=8, state="readonly"
         ).pack(side="left", padx=(6, 0))
 
-        self.hotkey_btn = tk.Button(hotkey_row, text="Start Hotkey", command=self.toggle_hotkey_mode)
+        self.hotkey_btn = tk.Button(hotkey_row, text=t("btn_start_hotkey"), command=self.toggle_hotkey_mode)
         self.hotkey_btn.pack(side="left", padx=(6, 0))
         self.themed_buttons.append(self.hotkey_btn)
 
@@ -253,7 +248,7 @@ class ResSwitcherApp(tk.Tk):
         native_row = tk.Frame(footer_frame)
         native_row.pack(fill="x", padx=10, pady=(6, 0))
         self.themed_frames.append(native_row)
-        native_label = tk.Label(native_row, text="Native:")
+        native_label = tk.Label(native_row, text=t("native_label"))
         native_label.pack(side="left")
         self.themed_labels.append(native_label)
         saved_native = cfg.get("native_res", native_str)
@@ -267,7 +262,7 @@ class ResSwitcherApp(tk.Tk):
         stretched_row = tk.Frame(footer_frame)
         stretched_row.pack(fill="x", padx=10, pady=(6, 0))
         self.themed_frames.append(stretched_row)
-        stretched_label = tk.Label(stretched_row, text="Stretched:")
+        stretched_label = tk.Label(stretched_row, text=t("stretched_label"))
         stretched_label.pack(side="left")
         self.themed_labels.append(stretched_label)
         saved_stretched = cfg.get("stretched_res", "1568x1080")
@@ -283,10 +278,10 @@ class ResSwitcherApp(tk.Tk):
         self.status_var = tk.StringVar(value="")
         self.status_label = tk.Label(footer_frame, textvariable=self.status_var, wraplength=250, fg="green")
         self.status_label.pack(pady=(14, 0), padx=10)
+        self.status_var.trace_add("write", lambda *args: self._fit_window_to_content())
 
         self.restore_banner = tk.Button(
-            footer_frame, text="A monitor may still be disabled from a previous "
-                       "session - click to restore it",
+            footer_frame, text=t("restore_banner_text"),
             wraplength=280, justify="left", relief="flat",
             command=self._restore_pending_from_banner
         )
@@ -295,24 +290,20 @@ class ResSwitcherApp(tk.Tk):
         bottom_row.pack(side="bottom", pady=(0, 14))
         self.themed_frames.append(bottom_row)
 
-        faq_btn = tk.Button(bottom_row, text="FAQ", command=self.show_faq)
+        faq_btn = tk.Button(bottom_row, text=t("btn_faq"), command=self.show_faq)
         faq_btn.pack(side="left", padx=4)
         self.themed_buttons.append(faq_btn)
 
-        monitors_btn = tk.Button(bottom_row, text="Monitors", command=self.show_monitors)
+        monitors_btn = tk.Button(bottom_row, text=t("btn_monitors"), command=self.show_monitors)
         monitors_btn.pack(side="left", padx=4)
         self.themed_buttons.append(monitors_btn)
 
-        self.theme_btn = tk.Button(bottom_row, text="Dark", width=5, command=self.toggle_theme)
-        self.theme_btn.pack(side="left", padx=4)
-        self.themed_buttons.append(self.theme_btn)
-
-        check_btn = tk.Button(bottom_row, text="Check", command=lambda: check_for_update(manual=True))
-        check_btn.pack(side="left", padx=4)
-        self.themed_buttons.append(check_btn)
+        settings_btn = tk.Button(bottom_row, text=t("btn_settings"), command=self.show_settings)
+        settings_btn.pack(side="left", padx=4)
+        self.themed_buttons.append(settings_btn)
 
         github_btn = tk.Button(
-            bottom_row, text="GitHub",
+            bottom_row, text=t("btn_github"),
             command=lambda: webbrowser.open("https://github.com/lxzydev/QuickRes")
         )
         github_btn.pack(side="left", padx=4)
@@ -327,12 +318,6 @@ class ResSwitcherApp(tk.Tk):
         self._fit_window_to_content()
 
     def _fit_window_to_content(self):
-        # QUICK_LIST and the custom resolutions list can grow over time —
-        # instead of a hardcoded window size that silently pushes footer
-        # controls (hotkey setup, FAQ/Monitors/theme/etc.) off-window once
-        # content overflows it, size the window to what's actually packed.
-        # Only the scrollable resolution area gives up space (and starts
-        # scrolling) if the total doesn't fit the screen.
         self.update_idletasks()
         self.scroll_content.update_idletasks()
         content_h = self.scroll_content.winfo_reqheight()
@@ -344,7 +329,7 @@ class ResSwitcherApp(tk.Tk):
 
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        margin = 80  # room for the taskbar and window chrome
+        margin = 80  
 
         win_w = min(total_w, screen_w - 40)
         win_h = min(total_h, screen_h - margin)
@@ -359,6 +344,7 @@ class ResSwitcherApp(tk.Tk):
 
     def toggle_theme(self):
         self.theme_name = "dark" if self.theme_name == "light" else "light"
+        update_config({"theme": self.theme_name})
         self.apply_theme()
 
     def apply_theme(self):
@@ -393,7 +379,8 @@ class ResSwitcherApp(tk.Tk):
         elif current_fg in ("red", THEMES["dark"]["status_err"]):
             self.status_label.configure(fg=colors["status_err"])
 
-        self.theme_btn.configure(text="Light" if self.theme_name == "dark" else "Dark")
+        if self.theme_btn is not None and self.theme_btn.winfo_exists():
+            self.theme_btn.configure(text=t("theme_light") if self.theme_name == "dark" else t("theme_dark"))
 
         if self.faq_win is not None and self.faq_win.winfo_exists():
             self.faq_win.configure(bg=colors["bg"])
@@ -417,6 +404,24 @@ class ResSwitcherApp(tk.Tk):
                 activebackground=colors["bg"], activeforeground=colors["status_err"]
             )
 
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.configure(bg=colors["bg"])
+            for widget in self.settings_themed_widgets:
+                if not widget.winfo_exists():
+                    continue
+                kind = widget.winfo_class()
+                if kind == "Label":
+                    widget.configure(bg=colors["bg"], fg=colors["fg"])
+                elif kind == "Frame":
+                    widget.configure(bg=colors["bg"])
+                elif kind == "Button":
+                    widget.configure(
+                        bg=colors["btn_bg"], fg=colors["btn_fg"],
+                        activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+                    )
+            if self.theme_btn is not None and self.theme_btn.winfo_exists():
+                self.theme_btn.configure(text=t("theme_light") if self.theme_name == "dark" else t("theme_dark"))
+
         if self.monitors_win is not None and self.monitors_win.winfo_exists():
             self.monitors_win.configure(bg=colors["bg"])
             for widget in self.monitors_themed_widgets:
@@ -430,16 +435,11 @@ class ResSwitcherApp(tk.Tk):
                         bg=colors["btn_bg"], fg=colors["btn_fg"],
                         activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
                     )
-            # Status/name labels carry status-specific colors, so rebuild them
-            # fully against the new theme rather than trying to patch in place.
+
             self._refresh_monitor_list()
 
         if self.revert_win is not None and self.revert_win.winfo_exists():
             self.revert_win.configure(bg=colors["bg"])
-            # The "Keep disabled"/"Revert now" buttons live inside a nested
-            # btn_frame (see _open_revert_dialog), not directly under
-            # revert_win, so a shallow winfo_children() misses them entirely
-            # — walk one level deeper for frames to actually reach them.
             for widget in self.revert_win.winfo_children():
                 kind = widget.winfo_class()
                 if kind == "Label":
@@ -491,7 +491,7 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
 
         faq_win = tk.Toplevel(self)
-        faq_win.title("FAQ")
+        faq_win.title(t("faq_window_title"))
         faq_win.resizable(False, False)
         faq_win.configure(bg=colors["bg"])
         self.faq_win = faq_win
@@ -521,7 +521,7 @@ class ResSwitcherApp(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True, padx=(14, 0), pady=14)
         scrollbar.pack(side="right", fill="y", pady=14)
 
-        for i, (question, answer) in enumerate(FAQ_ITEMS):
+        for i, (question, answer) in enumerate(_faq_items()):
             q_label = tk.Label(
                 content, text=question, justify="left", anchor="w",
                 wraplength=fw - 40, font=("Segoe UI", 10, "bold"),
@@ -539,7 +539,7 @@ class ResSwitcherApp(tk.Tk):
             self.faq_themed_widgets.append(a_label)
 
         close_btn = tk.Button(
-            faq_win, text="Close", command=lambda: self._close_faq(faq_win),
+            faq_win, text=t("btn_close"), command=lambda: self._close_faq(faq_win),
             bg=colors["btn_bg"], fg=colors["btn_fg"],
             activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
         )
@@ -551,8 +551,122 @@ class ResSwitcherApp(tk.Tk):
         self.faq_themed_widgets = []
         faq_win.destroy()
 
+    def show_settings(self):
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.lift()
+            self.settings_win.focus_force()
+            return
+
+        colors = THEMES[self.theme_name]
+
+        win = tk.Toplevel(self)
+        win.title("Settings")
+        win.resizable(False, False)
+        win.configure(bg=colors["bg"])
+        self.settings_win = win
+        self.settings_themed_widgets = []
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_settings(win))
+
+        sw, sh = 260, 230
+        win.geometry(f"{sw}x{sh}")
+        win.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - (sw // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (sh // 2)
+        win.geometry(f"{sw}x{sh}+{x}+{y}")
+
+        theme_row = tk.Frame(win, bg=colors["bg"])
+        theme_row.pack(fill="x", padx=16, pady=(18, 8))
+        self.settings_themed_widgets.append(theme_row)
+
+        theme_label = tk.Label(theme_row, text=t("settings_theme_label"), bg=colors["bg"], fg=colors["fg"])
+        theme_label.pack(side="left")
+        self.settings_themed_widgets.append(theme_label)
+
+        self.theme_btn = tk.Button(
+            theme_row, text=t("theme_light") if self.theme_name == "dark" else t("theme_dark"),
+            width=6, command=self.toggle_theme,
+            bg=colors["btn_bg"], fg=colors["btn_fg"],
+            activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+        )
+        self.theme_btn.pack(side="left", padx=(8, 0))
+        self.settings_themed_widgets.append(self.theme_btn)
+
+        language_row = tk.Frame(win, bg=colors["bg"])
+        language_row.pack(fill="x", padx=16, pady=(0, 8))
+        self.settings_themed_widgets.append(language_row)
+
+        language_label = tk.Label(language_row, text=t("settings_language_label"), bg=colors["bg"], fg=colors["fg"])
+        language_label.pack(side="left")
+        self.settings_themed_widgets.append(language_label)
+
+        lang_codes = list(i18n.LANGUAGE_NAMES.keys())
+        self.language_var = tk.StringVar(value=i18n.LANGUAGE_NAMES.get(self.language_setting, "Auto"))
+        language_combo = ttk.Combobox(
+            language_row, textvariable=self.language_var,
+            values=[i18n.LANGUAGE_NAMES[code] for code in lang_codes],
+            width=10, state="readonly"
+        )
+        language_combo.pack(side="left", padx=(8, 0))
+        language_combo.bind("<<ComboboxSelected>>", self._on_language_selected)
+
+        reset_btn = tk.Button(
+            win, text=t("btn_reset_custom_res"),
+            command=self._reset_custom_resolutions,
+            bg=colors["btn_bg"], fg=colors["btn_fg"],
+            activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+        )
+        reset_btn.pack(padx=16, pady=(4, 8), fill="x")
+        self.settings_themed_widgets.append(reset_btn)
+
+        check_btn = tk.Button(
+            win, text=t("btn_check_update"),
+            command=lambda: check_for_update(manual=True),
+            bg=colors["btn_bg"], fg=colors["btn_fg"],
+            activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+        )
+        check_btn.pack(padx=16, pady=(0, 8), fill="x")
+        self.settings_themed_widgets.append(check_btn)
+
+        close_btn = tk.Button(
+            win, text=t("btn_close"), command=lambda: self._close_settings(win),
+            bg=colors["btn_bg"], fg=colors["btn_fg"],
+            activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
+        )
+        close_btn.pack(side="bottom", pady=(0, 14))
+        self.settings_themed_widgets.append(close_btn)
+
+    def _on_language_selected(self, event):
+        name_to_code = {v: k for k, v in i18n.LANGUAGE_NAMES.items()}
+        selected_code = name_to_code.get(self.language_var.get(), "auto")
+        self.language_setting = selected_code
+        update_config({"language": selected_code})
+        i18n.set_language(i18n.resolve_language(selected_code))
+        self._retranslate_ui()
+
+    def _retranslate_ui(self):
+        # Static text needs a full rebuild to pick up the new language.
+        # Simplest reliable approach: relaunch the main window.
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self._close_settings(self.settings_win)
+        self.destroy()
+        new_app = ResSwitcherApp()
+        new_app.mainloop()
+
+    def _close_settings(self, win):
+        self.settings_win = None
+        self.settings_themed_widgets = []
+        self.theme_btn = None
+        win.destroy()
+
+    def _reset_custom_resolutions(self):
+        update_config({"custom_resolutions": []})
+        self._rebuild_custom_section()
+        self._sync_hotkey_dropdown_values()
+        self.status_label.config(fg=THEMES[self.theme_name]["status_ok"])
+        self.status_var.set(t("status_custom_cleared"))
+
     def _clear_placeholder(self, event):
-        if self.custom_entry.get() == "e.g. 1440x1080":
+        if self.custom_entry.get() == t("custom_res_placeholder"):
             self.custom_entry.delete(0, "end")
 
     def _parse_res(self, text: str):
@@ -566,15 +680,15 @@ class ResSwitcherApp(tk.Tk):
             if self.hotkey_toggle:
                 self.hotkey_toggle.stop()
             self.hotkey_running = False
-            self.hotkey_btn.config(text="Start Hotkey")
-            self.status_var.set("Hotkey: stopped")
+            self.hotkey_btn.config(text=t("btn_start_hotkey"))
+            self.status_var.set(t("status_hotkey_stopped"))
             return
 
         native = self._parse_res(self.native_var.get())
         stretched = self._parse_res(self.stretched_var.get())
         if not native or not stretched:
             self.status_label.config(fg=THEMES[self.theme_name]["status_err"])
-            self.status_var.set("Native/Stretched must look like 1920x1080")
+            self.status_var.set(t("status_res_format_error"))
             return
 
         update_config({
@@ -591,7 +705,7 @@ class ResSwitcherApp(tk.Tk):
         )
         self.hotkey_toggle.start()
         self.hotkey_running = True
-        self.hotkey_btn.config(text="Stop Hotkey")
+        self.hotkey_btn.config(text=t("btn_stop_hotkey"))
 
     def _set_status_threadsafe(self, message: str):
         self.after(0, lambda: (
@@ -610,7 +724,7 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
 
         dialog = tk.Toplevel(self)
-        dialog.title("Resolution not found")
+        dialog.title(t("dialog_res_not_found_title"))
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
@@ -625,8 +739,7 @@ class ResSwitcherApp(tk.Tk):
 
         tk.Label(
             dialog,
-            text=f"Couldn't detect {width} x {height} on your GPU driver.\n\n"
-                 "Would you like to open your graphics software to add it?",
+            text=t("dialog_res_not_found_body", width=width, height=height),
             wraplength=260, justify="left",
             bg=colors["bg"], fg=colors["fg"]
         ).pack(padx=16, pady=(16, 10))
@@ -645,24 +758,24 @@ class ResSwitcherApp(tk.Tk):
 
         if "nvidia" in vendors_to_show:
             tk.Button(
-                btn_frame, text="NVIDIA Control Panel", width=22,
+                btn_frame, text=t("btn_nvidia_panel"), width=22,
                 command=lambda: (open_nvidia_control_panel(), dialog.destroy()),
                 **btn_style
             ).pack(pady=3)
         if "amd" in vendors_to_show:
             tk.Button(
-                btn_frame, text="AMD Software", width=22,
+                btn_frame, text=t("btn_amd_software"), width=22,
                 command=lambda: (open_amd_software(), dialog.destroy()),
                 **btn_style
             ).pack(pady=3)
         if "intel" in vendors_to_show:
             tk.Button(
-                btn_frame, text="Intel Graphics Software", width=22,
+                btn_frame, text=t("btn_intel_graphics"), width=22,
                 command=lambda: (open_intel_graphics_software(), dialog.destroy()),
                 **btn_style
             ).pack(pady=3)
 
-        tk.Button(dialog, text="Cancel", command=dialog.destroy, **btn_style).pack(pady=(0, 12))
+        tk.Button(dialog, text=t("btn_cancel"), command=dialog.destroy, **btn_style).pack(pady=(0, 12))
 
     def apply_resolution(self, width, height):
         colors = THEMES[self.theme_name]
@@ -679,7 +792,7 @@ class ResSwitcherApp(tk.Tk):
         parsed = self._parse_res(text)
         if not parsed:
             self.status_label.config(fg=colors["status_err"])
-            self.status_var.set("Format like 1440x1080")
+            self.status_var.set(t("status_custom_format_error"))
             return
 
         width, height = parsed
@@ -737,7 +850,7 @@ class ResSwitcherApp(tk.Tk):
         self._rebuild_custom_section()
         self._sync_hotkey_dropdown_values()
         self.status_label.config(fg=THEMES[self.theme_name]["status_ok"])
-        self.status_var.set(f"Removed {res_str} from custom list")
+        self.status_var.set(t("status_removed_custom", res=res_str))
 
     def _sync_hotkey_dropdown_values(self):
         cfg = load_config()
@@ -758,7 +871,6 @@ class ResSwitcherApp(tk.Tk):
         self.native_combo["values"] = native_opts
         self.stretched_combo["values"] = merged
 
-    # -- Monitor enable/disable -------------------------------------------------
 
     def _check_pending_restore_on_startup(self):
         pending = load_pending_restore()
@@ -766,8 +878,7 @@ class ResSwitcherApp(tk.Tk):
             return
         instance_id = pending.get("instance_id")
         if not instance_id:
-            # Nothing actionable in this record — don't lock the UI or show
-            # a banner over a flag that can never be resolved either way.
+
             clear_pending_restore()
             return
         self._active_pending_instance_id = instance_id
@@ -789,10 +900,6 @@ class ResSwitcherApp(tk.Tk):
             self.restore_banner.pack_forget()
 
     def _restore_pending_from_banner(self):
-        # Reentrancy guard: without this, clicking the banner twice quickly
-        # (or once while an op from elsewhere is already running) could
-        # launch two elevated processes racing CM_Enable/CM_Disable calls
-        # against the same device.
         if self._monitor_op_in_flight:
             return
         pending = load_pending_restore()
@@ -807,7 +914,7 @@ class ResSwitcherApp(tk.Tk):
             return
         self._hide_restore_banner()
         self.status_label.config(fg=THEMES[self.theme_name]["fg"])
-        self.status_var.set(f"Restoring {friendly_name}...")
+        self.status_var.set(t("status_restoring", name=friendly_name))
         self._monitor_op_in_flight = True
         self._run_threaded_monitor_op(
             monitors_mod.enable_monitor, instance_id,
@@ -818,42 +925,26 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
         self._monitor_op_in_flight = False
         if not ok and message == monitors_mod.TIMEOUT_MESSAGE:
-            # Genuinely unknown outcome, not a confirmed failure — the
-            # elevated process may still be waiting on a slow UAC prompt and
-            # could finish moments later, off in the background. Don't touch
-            # the recovery flag or the lock; leave it to a later check.
             self.status_label.config(fg=colors["fg"])
-            self.status_var.set(
-                f"Still waiting on admin approval to restore {friendly_name} — "
-                f"check again in a moment."
-            )
+            self.status_var.set(t("status_restore_pending", name=friendly_name))
             if self.monitors_win is not None and self.monitors_win.winfo_exists():
                 self._refresh_monitor_list()
             return
         if not ok and message.startswith(monitors_mod.DEVICE_NOT_FOUND_PREFIX):
-            # The device is gone (unplugged/replaced) — nothing left to
-            # protect, so the flag is stale. Clear it instead of leaving the
-            # user stuck retrying a restore that can never succeed.
             clear_pending_restore()
             self._active_pending_instance_id = None
             self._hide_restore_banner()
             self.status_label.config(fg=colors["status_err"])
-            self.status_var.set(
-                f"{friendly_name} is no longer present on this system — cleared the stale recovery flag."
-            )
+            self.status_var.set(t("status_device_gone", name=friendly_name))
             if self.monitors_win is not None and self.monitors_win.winfo_exists():
                 self._refresh_monitor_list()
             return
-        status_text = f"Restored {friendly_name}"
+        status_text = t("status_restored", name=friendly_name)
         if not ok:
-            # Same false-negative risk as the disable path, mirrored: a
-            # reported failure doesn't prove the re-enable didn't actually
-            # happen. Don't leave the "still disabled" banner up forever
-            # over a stale/unconfirmed result if the device is really back.
             actual = self._find_monitor(instance_id)
             if actual is not None and actual.is_enabled:
                 ok = True
-                status_text = f"Restored {friendly_name} (result was unconfirmed, verified by re-check)"
+                status_text = t("status_restored_unconfirmed", name=friendly_name)
         if ok:
             clear_pending_restore()
             self._active_pending_instance_id = None
@@ -862,32 +953,19 @@ class ResSwitcherApp(tk.Tk):
         else:
             self._show_restore_banner()
             self.status_label.config(fg=colors["status_err"])
-            self.status_var.set(
-                f"Failed to restore {friendly_name}: {message}. Please retry manually."
-            )
+            self.status_var.set(t("status_restore_failed", name=friendly_name, message=message))
         if self.monitors_win is not None and self.monitors_win.winfo_exists():
             self._refresh_monitor_list()
 
     def _run_threaded_monitor_op(self, op_func, instance_id, on_done):
         def worker():
-            # Without this, an unexpected exception from op_func (a raw
-            # ctypes/OS call) would skip on_done entirely, leaving
-            # _monitor_op_in_flight/_active_pending_instance_id stuck set
-            # forever — every action button permanently disabled and the
-            # status label frozen on "Requesting admin approval..." with no
-            # way out short of restarting the app.
             try:
                 ok, message = op_func(instance_id)
             except Exception as e:
-                ok, message = False, f"Unexpected error: {e}"
+                ok, message = False, t("status_unexpected_error", error=e)
             try:
                 self.after(0, lambda: on_done(ok, message))
             except Exception:
-                # Main window was closed while this op was still running.
-                # The elevated helper's real work (CM_Disable/Enable) has
-                # already happened regardless — pending_restore.json still
-                # correctly reflects reality on disk even though there's no
-                # UI left to update.
                 pass
         threading.Thread(target=worker, daemon=True).start()
 
@@ -900,7 +978,7 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
 
         win = tk.Toplevel(self)
-        win.title("Monitors")
+        win.title(t("monitors_window_title"))
         win.resizable(False, False)
         win.configure(bg=colors["bg"])
         self.monitors_win = win
@@ -919,7 +997,7 @@ class ResSwitcherApp(tk.Tk):
         self.monitors_themed_widgets.append(self.monitors_list_frame)
 
         close_btn = tk.Button(
-            win, text="Close", command=lambda: self._close_monitors(win),
+            win, text=t("btn_close"), command=lambda: self._close_monitors(win),
             bg=colors["btn_bg"], fg=colors["btn_fg"],
             activebackground=colors["btn_active"], activeforeground=colors["btn_fg"]
         )
@@ -930,18 +1008,12 @@ class ResSwitcherApp(tk.Tk):
         self._refresh_monitor_list()
 
     def _reconcile_stuck_pending(self):
-        # A disable that hit TIMEOUT_MESSAGE leaves _active_pending_instance_id
-        # set with no confirm/revert dialog driving it (we didn't know the
-        # outcome yet, so none was opened) — the UI stays locked until this
-        # resolves. By the time the user reopens Monitors, the elevated
-        # helper has almost certainly finished one way or the other, so
-        # re-check now instead of leaving them stuck until an app restart.
         if self._active_pending_instance_id is None:
             return
         if self.revert_win is not None and self.revert_win.winfo_exists():
-            return  # a normal awaiting-confirmation dialog is already open
+            return  
         if self._monitor_op_in_flight:
-            return  # something is actively running right now, don't interfere
+            return 
 
         pending = load_pending_restore()
         if pending is None:
@@ -956,14 +1028,11 @@ class ResSwitcherApp(tk.Tk):
 
         actual = self._find_monitor(instance_id)
         if actual is None:
-            return  # still can't confirm — stay locked, fail safe
+            return 
         if actual.is_enabled:
-            # Confirmed back on — nothing left to protect.
             clear_pending_restore()
             self._active_pending_instance_id = None
         else:
-            # Confirmed disabled — resume the normal keep/revert flow instead
-            # of leaving it silently locked with no dialog to act on.
             self._active_pending_instance_id = instance_id
             self._open_revert_dialog(instance_id, friendly_name)
 
@@ -987,7 +1056,7 @@ class ResSwitcherApp(tk.Tk):
 
         if not monitor_list:
             empty_label = tk.Label(
-                self.monitors_list_frame, text="No monitors found.",
+                self.monitors_list_frame, text=t("monitors_none_found"),
                 bg=colors["bg"], fg=colors["fg"]
             )
             empty_label.pack(pady=8)
@@ -1004,7 +1073,7 @@ class ResSwitcherApp(tk.Tk):
             )
             name_label.pack(side="left", fill="x", expand=True)
 
-            status_text = "Enabled" if mon.is_enabled else "Disabled"
+            status_text = t("monitor_status_enabled") if mon.is_enabled else t("monitor_status_disabled")
             status_color = colors["status_ok"] if mon.is_enabled else colors["status_err"]
             status_label = tk.Label(
                 row, text=status_text, width=8,
@@ -1012,7 +1081,7 @@ class ResSwitcherApp(tk.Tk):
             )
             status_label.pack(side="left", padx=(4, 4))
 
-            action_text = "Disable" if mon.is_enabled else "Enable"
+            action_text = t("btn_disable") if mon.is_enabled else t("btn_enable")
             locked = self._monitor_op_in_flight or self._active_pending_instance_id is not None
             action_btn = tk.Button(
                 row, text=action_text, width=8,
@@ -1026,9 +1095,6 @@ class ResSwitcherApp(tk.Tk):
             self.monitor_rows[mon.instance_id] = row
 
     def _on_monitor_action_click(self, monitor):
-        # Defensive: the row button is disabled while a op is in flight or a
-        # disable is awaiting confirmation, but guard here too in case a click
-        # slips in before the UI catches up (e.g. a queued event).
         if self._monitor_op_in_flight or self._active_pending_instance_id is not None:
             return
 
@@ -1037,27 +1103,6 @@ class ResSwitcherApp(tk.Tk):
         friendly_name = monitor.friendly_name
 
         if monitor.is_enabled:
-            # Refuse to disable the only currently-enabled monitor: QuickRes
-            # is for turning off the *extra* monitor(s), not the one the
-            # user is actually looking at. Without this, disabling it blacks
-            # out the screen, and if the elevated call also happens to time
-            # out, there's no visible UI left to recover from.
-            other_enabled = [
-                m for m in monitors_mod.enumerate_monitors()
-                if m.is_enabled and m.instance_id != instance_id
-            ]
-            if not other_enabled:
-                self.status_label.config(fg=colors["status_err"])
-                self.status_var.set(
-                    f"Refusing to disable {friendly_name} — it's the only "
-                    f"enabled monitor. QuickRes is for disabling the extra "
-                    f"monitor(s), not your only display."
-                )
-                return
-            # Disabling is the risky direction: write the crash-recovery flag
-            # before we ever hand off to the elevated helper. If we can't
-            # persist that flag, the whole safety net is void, so refuse to
-            # disable rather than proceed unprotected.
             if not save_pending_restore({
                 "instance_id": instance_id,
                 "friendly_name": friendly_name,
@@ -1065,12 +1110,9 @@ class ResSwitcherApp(tk.Tk):
                 "started_at": time.time(),
             }):
                 self.status_label.config(fg=colors["status_err"])
-                self.status_var.set(
-                    f"Could not write the crash-recovery flag — refusing to disable "
-                    f"{friendly_name}. Check disk space/permissions and try again."
-                )
+                self.status_var.set(t("status_write_flag_failed", name=friendly_name))
                 return
-            self.status_var.set(f"Requesting admin approval to disable {friendly_name}...")
+            self.status_var.set(t("status_requesting_disable", name=friendly_name))
             self.status_label.config(fg=colors["fg"])
             self._monitor_op_in_flight = True
             self._refresh_monitor_list()
@@ -1079,7 +1121,7 @@ class ResSwitcherApp(tk.Tk):
                 lambda ok, message: self._on_disable_complete(ok, message, monitor)
             )
         else:
-            self.status_var.set(f"Requesting admin approval to enable {friendly_name}...")
+            self.status_var.set(t("status_requesting_enable", name=friendly_name))
             self.status_label.config(fg=colors["fg"])
             self._monitor_op_in_flight = True
             self._refresh_monitor_list()
@@ -1098,44 +1140,17 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
         self._monitor_op_in_flight = False
         if not ok and message == monitors_mod.TIMEOUT_MESSAGE:
-            # Genuinely unknown outcome, not a confirmed failure — the
-            # elevated process may still be waiting on a slow UAC prompt and
-            # could disable the device moments later, off in the background.
-            # The recovery flag was already written before we started, so
-            # leave it exactly as-is (don't clear it, don't guess a verdict
-            # from an immediate re-check that would just see "not yet").
-            #
-            # Keep the lock on too: without this, _active_pending_instance_id
-            # stays None, _on_monitor_action_click's guard stops blocking,
-            # and the user could start disabling a SECOND monitor — whose
-            # save_pending_restore() call would overwrite this monitor's
-            # still-possibly-completing entry in the single-record
-            # pending_restore.json, silently losing its recovery flag.
             self._active_pending_instance_id = monitor.instance_id
             self.status_label.config(fg=colors["fg"])
-            self.status_var.set(
-                f"Still waiting on admin approval to disable {monitor.friendly_name} — "
-                f"reopen Monitors in a moment to see the real state."
-            )
+            self.status_var.set(t("status_disable_pending", name=monitor.friendly_name))
             self._refresh_monitor_list()
             return
         if not ok:
-            # A reported failure (its result file never got written) does
-            # NOT prove the disable didn't happen — the elevated process may
-            # have succeeded and just failed to report back. Re-check the
-            # real device state before ever clearing the crash-recovery flag
-            # on a false negative, which would otherwise strand a genuinely
-            # disabled monitor with no recovery flag and no restore banner.
             actual = self._find_monitor(monitor.instance_id)
             if actual is not None and not actual.is_enabled:
                 ok = True
-                message = f"{monitor.friendly_name} disabled (result was unconfirmed, verified by re-check)"
+                message = t("status_disable_unconfirmed", name=monitor.friendly_name)
         if ok:
-            # Stays locked (via _active_pending_instance_id) until the user
-            # confirms or the 10s auto-revert resolves it — only one risky
-            # pending action can be tracked at a time (pending_restore.json
-            # holds a single record), so no other monitor can be touched
-            # while this one is unresolved.
             self._active_pending_instance_id = monitor.instance_id
             self.status_label.config(fg=colors["status_ok"])
             self.status_var.set(message)
@@ -1151,25 +1166,15 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
         self._monitor_op_in_flight = False
         if not ok and message == monitors_mod.TIMEOUT_MESSAGE:
-            # Same "genuinely unknown, not a confirmed failure" case as the
-            # other three completion handlers — don't render it as a plain
-            # failure (wrong color, misleading text). This direction never
-            # sets the pending-restore lock, so there's nothing else to do.
             self.status_label.config(fg=colors["fg"])
-            self.status_var.set(
-                f"Still waiting on admin approval to enable {monitor.friendly_name} — "
-                f"check again in a moment."
-            )
+            self.status_var.set(t("status_enable_pending", name=monitor.friendly_name))
             self._refresh_monitor_list()
             return
         if not ok:
-            # Same false-negative risk as the other three completion
-            # handlers, mirrored here for message accuracy: a reported
-            # failure doesn't prove the enable didn't actually happen.
             actual = self._find_monitor(monitor.instance_id)
             if actual is not None and actual.is_enabled:
                 ok = True
-                message = f"{monitor.friendly_name} enabled (result was unconfirmed, verified by re-check)"
+                message = t("status_enable_unconfirmed", name=monitor.friendly_name)
         self.status_label.config(fg=colors["status_ok"] if ok else colors["status_err"])
         self.status_var.set(message)
         self._refresh_monitor_list()
@@ -1178,15 +1183,11 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
 
         win = tk.Toplevel(self)
-        win.title("Keep this monitor disabled?")
+        win.title(t("revert_dialog_title"))
         win.resizable(False, False)
         win.transient(self)
         win.configure(bg=colors["bg"])
         self.revert_win = win
-        # Dismissing via the titlebar X isn't a decision to "keep disabled" —
-        # treat it the same as clicking "Revert now" (the safe default),
-        # instead of leaving revert_win pointing at a destroyed widget while
-        # the countdown keeps running invisibly with no dialog left to act on.
         win.protocol("WM_DELETE_WINDOW", lambda: self._revert_now(win, instance_id, friendly_name))
 
         dw, dh = 300, 160
@@ -1196,7 +1197,7 @@ class ResSwitcherApp(tk.Tk):
         y = self.winfo_y() + (self.winfo_height() // 2) - (dh // 2)
         win.geometry(f"{dw}x{dh}+{x}+{y}")
 
-        countdown_var = tk.StringVar(value=f"Reverting in {10}s")
+        countdown_var = tk.StringVar(value=t("revert_countdown", seconds=10))
         countdown_label = tk.Label(
             win, textvariable=countdown_var, wraplength=260,
             bg=colors["bg"], fg=colors["fg"]
@@ -1209,7 +1210,7 @@ class ResSwitcherApp(tk.Tk):
             if self.revert_win is not win or not win.winfo_exists():
                 return
             remaining["seconds"] -= 1
-            countdown_var.set(f"Reverting in {remaining['seconds']}s")
+            countdown_var.set(t("revert_countdown", seconds=remaining["seconds"]))
             if remaining["seconds"] > 0:
                 self.after(1000, tick)
 
@@ -1233,13 +1234,13 @@ class ResSwitcherApp(tk.Tk):
         )
 
         tk.Button(
-            btn_frame, text="Keep disabled", width=13,
+            btn_frame, text=t("btn_keep_disabled"), width=13,
             command=lambda: self._confirm_keep_disabled(win),
             **btn_style
         ).pack(side="left", padx=4)
 
         tk.Button(
-            btn_frame, text="Revert now", width=13,
+            btn_frame, text=t("btn_revert_now"), width=13,
             command=lambda: self._revert_now(win, instance_id, friendly_name),
             **btn_style
         ).pack(side="left", padx=4)
@@ -1255,8 +1256,6 @@ class ResSwitcherApp(tk.Tk):
 
     def _revert_now(self, win, instance_id, friendly_name):
         if self.pending_guard is not None:
-            # Stop the auto-revert timer so it doesn't fire a second time;
-            # the manual click below performs the same revert path instead.
             self.pending_guard.confirm()
             self.pending_guard = None
         self._close_revert_dialog(win)
@@ -1269,18 +1268,12 @@ class ResSwitcherApp(tk.Tk):
             win.destroy()
 
     def _start_revert(self, instance_id, friendly_name):
-        # The auto-revert timeout calls this directly (as PendingDisableGuard's
-        # revert_callback) without going through _revert_now, so the confirm
-        # dialog would otherwise stay on screen showing stale "Keep
-        # disabled"/"Revert now" choices after the monitor's already been
-        # re-enabled. Close it here too — idempotent when _revert_now already
-        # closed it.
         if self.revert_win is not None:
             self._close_revert_dialog(self.revert_win)
 
         colors = THEMES[self.theme_name]
         self.status_label.config(fg=colors["fg"])
-        self.status_var.set(f"Reverting {friendly_name}...")
+        self.status_var.set(t("status_reverting", name=friendly_name))
         self._monitor_op_in_flight = True
         self._run_threaded_monitor_op(
             monitors_mod.enable_monitor, instance_id,
@@ -1291,55 +1284,34 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
         self._monitor_op_in_flight = False
         if not ok and message == monitors_mod.TIMEOUT_MESSAGE:
-            # Genuinely unknown outcome, not a confirmed failure — leave the
-            # recovery flag and lock exactly as they are and let a later
-            # check (reopening Monitors, or the startup banner) resolve it.
             self.status_label.config(fg=colors["fg"])
-            self.status_var.set(
-                f"Still waiting on admin approval to revert {friendly_name} — "
-                f"check again in a moment."
-            )
+            self.status_var.set(t("status_revert_pending", name=friendly_name))
             if self.monitors_win is not None and self.monitors_win.winfo_exists():
                 self._refresh_monitor_list()
             return
         if not ok and message.startswith(monitors_mod.DEVICE_NOT_FOUND_PREFIX):
-            # The device is gone (unplugged/replaced) — nothing left to
-            # protect, so the flag is stale. Clear it instead of leaving the
-            # user stuck retrying a revert that can never succeed.
             clear_pending_restore()
             self._active_pending_instance_id = None
             self._hide_restore_banner()
             self.status_label.config(fg=colors["status_err"])
-            self.status_var.set(
-                f"{friendly_name} is no longer present on this system — cleared the stale recovery flag."
-            )
+            self.status_var.set(t("status_device_gone", name=friendly_name))
             if self.monitors_win is not None and self.monitors_win.winfo_exists():
                 self._refresh_monitor_list()
             return
-        status_text = f"Reverted {friendly_name}"
+        status_text = t("status_reverted", name=friendly_name)
         if not ok:
-            # Same false-negative risk as the disable path, mirrored: a
-            # reported failure doesn't prove the re-enable didn't actually
-            # happen — don't leave the monitor locked/the recovery flag set
-            # over a stale/unconfirmed result if it's really back on.
             actual = self._find_monitor(instance_id)
             if actual is not None and actual.is_enabled:
                 ok = True
-                status_text = f"Reverted {friendly_name} (result was unconfirmed, verified by re-check)"
+                status_text = t("status_reverted_unconfirmed", name=friendly_name)
         if ok:
             clear_pending_restore()
             self._active_pending_instance_id = None
             self.status_label.config(fg=colors["status_ok"])
             self.status_var.set(status_text)
         else:
-            # Leave the pending-restore flag AND the lock in place — the
-            # monitor is still in an unresolved, potentially-disabled state,
-            # so don't let the user start touching other monitors until this
-            # is resolved (via the startup/banner retry path).
             self.status_label.config(fg=colors["status_err"])
-            self.status_var.set(
-                f"Failed to revert {friendly_name}: {message}. Please retry manually."
-            )
+            self.status_var.set(t("status_revert_failed", name=friendly_name, message=message))
             self._show_restore_banner()
         if self.monitors_win is not None and self.monitors_win.winfo_exists():
             self._refresh_monitor_list()

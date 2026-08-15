@@ -7,7 +7,6 @@ from tkinter import messagebox
 
 from quickres import __version__, UPDATE_URL
 
-
 def fetch_version_info():
     request = urllib.request.Request(
         UPDATE_URL,

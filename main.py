@@ -8,7 +8,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if "--monitor-op" in sys.argv:
-        # Elevated helper mode: perform the op headlessly and exit, no GUI, no mutex.
         import argparse
         from quickres.monitors import run_elevated_worker_op
 
@@ -27,10 +26,6 @@ if __name__ == "__main__":
             with open(args.result_file, "w", encoding="utf-8") as f:
                 json.dump({"ok": ok, "message": message}, f)
         except Exception:
-            # Nothing left to report to (the result file IS the report
-            # channel) — exit non-zero so the parent's missing-file check
-            # in run_elevated_monitor_op still surfaces a clear failure
-            # instead of an unhandled traceback here.
             sys.exit(1)
         sys.exit(0 if ok else 1)
 
