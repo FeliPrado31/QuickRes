@@ -99,18 +99,11 @@ class ResSwitcherApp(tk.Tk):
 
         self.title("QuickRes")
         self.resizable(False, False)
-        self.geometry("340x500")
 
         try:
             self.iconbitmap(resource_path("icon.ico"))
         except Exception:
             pass
-
-        self.update_idletasks()
-        w, h = 410, 529
-        x = (self.winfo_screenwidth() // 2) - (w // 2)
-        y = (self.winfo_screenheight() // 2) - (h // 2)
-        self.geometry(f"{w}x{h}+{x}+{y}")
 
         self.theme_name = "light"
         self.themed_frames = []
@@ -145,7 +138,40 @@ class ResSwitcherApp(tk.Tk):
         self.supported_resolutions = get_supported_resolutions()
         self.gpu_vendors = None
 
-        grid_frame = tk.Frame(self)
+        # Scrollable area: holds the quick-resolution grid and the custom
+        # resolutions list, the two things that grow over time. Everything
+        # below it (hotkey setup, FAQ/Monitors/theme/etc.) is packed
+        # directly on the window instead, so that growth can never push
+        # those controls outside the visible window again.
+        scroll_outer = tk.Frame(self)
+        scroll_outer.pack(fill="both", expand=True)
+        self.themed_frames.append(scroll_outer)
+
+        self.scroll_canvas = tk.Canvas(scroll_outer, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(scroll_outer, orient="vertical", command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        self.scroll_canvas.pack(side="left", fill="both", expand=True)
+        self._scrollbar = scrollbar
+
+        scroll_content = tk.Frame(self.scroll_canvas)
+        self.themed_frames.append(scroll_content)
+        self.scroll_content = scroll_content
+        self._scroll_window_id = self.scroll_canvas.create_window((0, 0), window=scroll_content, anchor="nw")
+
+        def _on_scroll_content_configure(event):
+            self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+        scroll_content.bind("<Configure>", _on_scroll_content_configure)
+
+        def _on_canvas_configure(event):
+            self.scroll_canvas.itemconfig(self._scroll_window_id, width=event.width)
+        self.scroll_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            self.scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.scroll_canvas.bind("<Enter>", lambda e: self.scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        self.scroll_canvas.bind("<Leave>", lambda e: self.scroll_canvas.unbind_all("<MouseWheel>"))
+
+        grid_frame = tk.Frame(scroll_content)
         grid_frame.pack(pady=(4, 8))
         self.themed_frames.append(grid_frame)
 
@@ -158,11 +184,11 @@ class ResSwitcherApp(tk.Tk):
             btn.grid(row=row, column=col, padx=4, pady=4)
             self.themed_buttons.append(btn)
 
-        self.custom_label = tk.Label(self, text="Custom Resolution", font=("Segoe UI", 9, "bold"))
+        self.custom_label = tk.Label(scroll_content, text="Custom Resolution", font=("Segoe UI", 9, "bold"))
         self.custom_label.pack(pady=(4, 4))
         self.themed_labels.append(self.custom_label)
 
-        custom_row = tk.Frame(self)
+        custom_row = tk.Frame(scroll_content)
         custom_row.pack(pady=(0, 6))
         self.themed_frames.append(custom_row)
         self.custom_entry = tk.Entry(custom_row, width=14)
@@ -175,21 +201,28 @@ class ResSwitcherApp(tk.Tk):
         custom_btn.pack(side="left", padx=(6, 0))
         self.themed_buttons.append(custom_btn)
 
-        self.custom_grid = tk.Frame(self)
+        self.custom_grid = tk.Frame(scroll_content)
         self.custom_grid.pack(pady=(0, 4))
         self.themed_frames.append(self.custom_grid)
         self.custom_buttons = []
 
-        self.separator = ttk.Separator(self, orient="horizontal")
+        # Footer: always packed directly on the window (never inside the
+        # scrollable area), so it stays visible no matter how long the
+        # quick-resolution or custom-resolution lists grow.
+        footer_frame = tk.Frame(self)
+        footer_frame.pack(side="bottom", fill="x")
+        self.themed_frames.append(footer_frame)
+
+        self.separator = ttk.Separator(footer_frame, orient="horizontal")
         self.separator.pack(fill="x", pady=10, padx=10)
 
-        hotkey_title = tk.Label(self, text="Hotkey Toggle", font=("Segoe UI", 9, "bold"))
+        hotkey_title = tk.Label(footer_frame, text="Hotkey Toggle", font=("Segoe UI", 9, "bold"))
         hotkey_title.pack(anchor="w", padx=10)
         self.themed_labels.append(hotkey_title)
 
         cfg = load_config()
 
-        hotkey_row = tk.Frame(self)
+        hotkey_row = tk.Frame(footer_frame)
         hotkey_row.pack(fill="x", padx=10, pady=(4, 0))
         self.themed_frames.append(hotkey_row)
         hotkey_label = tk.Label(hotkey_row, text="Hotkey:")
@@ -217,7 +250,7 @@ class ResSwitcherApp(tk.Tk):
         else:
             native_str = res_options[0]
 
-        native_row = tk.Frame(self)
+        native_row = tk.Frame(footer_frame)
         native_row.pack(fill="x", padx=10, pady=(6, 0))
         self.themed_frames.append(native_row)
         native_label = tk.Label(native_row, text="Native:")
@@ -231,7 +264,7 @@ class ResSwitcherApp(tk.Tk):
         )
         self.native_combo.pack(side="left", padx=(6, 0))
 
-        stretched_row = tk.Frame(self)
+        stretched_row = tk.Frame(footer_frame)
         stretched_row.pack(fill="x", padx=10, pady=(6, 0))
         self.themed_frames.append(stretched_row)
         stretched_label = tk.Label(stretched_row, text="Stretched:")
@@ -248,17 +281,17 @@ class ResSwitcherApp(tk.Tk):
         self.stretched_combo.pack(side="left", padx=(6, 0))
 
         self.status_var = tk.StringVar(value="")
-        self.status_label = tk.Label(self, textvariable=self.status_var, wraplength=250, fg="green")
+        self.status_label = tk.Label(footer_frame, textvariable=self.status_var, wraplength=250, fg="green")
         self.status_label.pack(pady=(14, 0), padx=10)
 
         self.restore_banner = tk.Button(
-            self, text="A monitor may still be disabled from a previous "
+            footer_frame, text="A monitor may still be disabled from a previous "
                        "session - click to restore it",
             wraplength=280, justify="left", relief="flat",
             command=self._restore_pending_from_banner
         )
 
-        bottom_row = tk.Frame(self)
+        bottom_row = tk.Frame(footer_frame)
         bottom_row.pack(side="bottom", pady=(0, 14))
         self.themed_frames.append(bottom_row)
 
@@ -291,6 +324,38 @@ class ResSwitcherApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, check_for_update)
         self._check_pending_restore_on_startup()
+        self._fit_window_to_content()
+
+    def _fit_window_to_content(self):
+        # QUICK_LIST and the custom resolutions list can grow over time —
+        # instead of a hardcoded window size that silently pushes footer
+        # controls (hotkey setup, FAQ/Monitors/theme/etc.) off-window once
+        # content overflows it, size the window to what's actually packed.
+        # Only the scrollable resolution area gives up space (and starts
+        # scrolling) if the total doesn't fit the screen.
+        self.update_idletasks()
+        self.scroll_content.update_idletasks()
+        content_h = self.scroll_content.winfo_reqheight()
+        self.scroll_canvas.configure(height=content_h)
+        self.update_idletasks()
+
+        total_w = self.winfo_reqwidth()
+        total_h = self.winfo_reqheight()
+
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        margin = 80  # room for the taskbar and window chrome
+
+        win_w = min(total_w, screen_w - 40)
+        win_h = min(total_h, screen_h - margin)
+
+        if win_h < total_h:
+            overflow = total_h - win_h
+            self.scroll_canvas.configure(height=max(content_h - overflow, 80))
+
+        x = (screen_w // 2) - (win_w // 2)
+        y = (screen_h // 2) - (win_h // 2)
+        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
 
     def toggle_theme(self):
         self.theme_name = "dark" if self.theme_name == "light" else "light"
@@ -300,6 +365,7 @@ class ResSwitcherApp(tk.Tk):
         colors = THEMES[self.theme_name]
 
         self.configure(bg=colors["bg"])
+        self.scroll_canvas.configure(bg=colors["canvas_bg"])
 
         for frame in self.themed_frames:
             frame.configure(bg=colors["bg"])
@@ -395,6 +461,12 @@ class ResSwitcherApp(tk.Tk):
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TSeparator", background=colors["bg"])
+        style.configure(
+            "Vertical.TScrollbar",
+            background=colors["btn_bg"],
+            troughcolor=colors["bg"],
+            arrowcolor=colors["fg"],
+        )
         style.configure(
             "TCombobox",
             fieldbackground=colors["entry_bg"],
@@ -654,7 +726,7 @@ class ResSwitcherApp(tk.Tk):
             self.themed_buttons.append(btn)
             self.custom_buttons.append(btn)
 
-        self._resize_for_custom(len(customs))
+        self._fit_window_to_content()
 
     def _remove_custom(self, res_str):
         cfg = load_config()
@@ -685,16 +757,6 @@ class ResSwitcherApp(tk.Tk):
 
         self.native_combo["values"] = native_opts
         self.stretched_combo["values"] = merged
-
-    def _resize_for_custom(self, count):
-        extra = 0
-        if count:
-            rows = (count + 1) // 2
-            extra = 30 + rows * 42
-        new_h = 529 + extra
-        x = self.winfo_x()
-        y = self.winfo_y()
-        self.geometry(f"410x{new_h}+{x}+{y}")
 
     # -- Monitor enable/disable -------------------------------------------------
 
