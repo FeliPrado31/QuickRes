@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickRes</title>
+<style>
+:root{color-scheme:light dark}
+html,body{height:100%;margin:0}
+body{overflow:hidden}
+[data-theme="dark"]{--bg:#0d0f12;--s1:#14171c;--s2:#1b1f26;--s3:#232830;--bd:rgba(255,255,255,.07);--bd2:rgba(255,255,255,.14);--tx:#e7e9ec;--mu:#8a919c;--ac:oklch(.76 .12 196);--acbg:oklch(.76 .12 196 / .13);--ok:oklch(.78 .15 152);--okbg:oklch(.78 .15 152 / .12);--er:oklch(.7 .19 24);--erbg:oklch(.7 .19 24 / .13);--wn:oklch(.82 .13 78);--wnbg:oklch(.82 .13 78 / .12);--sh:0 8px 28px rgba(0,0,0,.55)}
+[data-theme="light"]{--bg:#eef0f3;--s1:#ffffff;--s2:#f5f6f8;--s3:#e9ebef;--bd:rgba(0,0,0,.09);--bd2:rgba(0,0,0,.18);--tx:#15181d;--mu:#5c636e;--ac:oklch(.55 .13 196);--acbg:oklch(.55 .13 196 / .1);--ok:oklch(.52 .14 152);--okbg:oklch(.52 .14 152 / .1);--er:oklch(.54 .19 24);--erbg:oklch(.54 .19 24 / .1);--wn:oklch(.58 .12 78);--wnbg:oklch(.58 .12 78 / .12);--sh:0 8px 28px rgba(0,0,0,.16)}
+
+.qr-app{width:100%;height:100%;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--bg);color:var(--tx);font-family:'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;font-size:13px}
+
+.qr-titlebar{display:flex;align-items:center;gap:9px;padding:13px 14px 11px;border-bottom:1px solid var(--bd);background:var(--s1)}
+.qr-logo{display:flex;align-items:center;gap:8px;text-decoration:none;color:var(--tx);cursor:pointer;background:none;border:none;padding:0;font:inherit}
+.qr-logo-dot{width:15px;height:15px;border-radius:4px;background:var(--ac);box-shadow:0 0 12px var(--acbg)}
+.qr-logo-text{font-size:15px;font-weight:650;letter-spacing:-.01em}
+.qr-version{font-family:Consolas,'Cascadia Mono',ui-monospace,monospace;font-size:10px;color:var(--mu);padding:2px 5px;border:1px solid var(--bd);border-radius:4px}
+.qr-theme-toggle{font:11px/1 inherit;color:var(--mu);background:var(--s2);border:1px solid var(--bd);border-radius:6px;padding:6px 9px;cursor:pointer}
+
+.qr-scroll{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:14px}
+.qr-scroll::-webkit-scrollbar{width:8px}
+.qr-scroll::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:8px}
+.qr-scroll::-webkit-scrollbar-track{background:transparent}
+
+.qr-section-head{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+.qr-eyebrow{font-family:Consolas,ui-monospace,monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)}
+.qr-rule{flex:1;height:1px;background:var(--bd)}
+
+.qr-res-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.qr-res{display:grid;gap:3px;text-align:left;background:var(--s1);border:1px solid var(--bd);border-radius:8px;padding:9px 10px;cursor:pointer;color:var(--tx);transition:border-color .12s,background .12s}
+.qr-res:hover{border-color:var(--ac);background:var(--s2)}
+.qr-res:active{transform:translateY(1px)}
+.qr-res-value{font-family:Consolas,ui-monospace,monospace;font-size:14.5px;font-weight:600}
+.qr-res-tag{font-size:9.5px;letter-spacing:.06em;text-transform:uppercase}
+
+.qr-custom-row{display:flex;gap:7px}
+.qr-custom-input{flex:1;min-width:0;font-family:Consolas,ui-monospace,monospace;font-size:12.5px;color:var(--tx);background:var(--s2);border:1px solid var(--bd);border-radius:7px;padding:8px 10px}
+.qr-custom-apply{font:600 12px/1 inherit;color:#06141a;background:var(--ac);border:none;border-radius:7px;padding:0 14px;cursor:pointer}
+.qr-custom-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.qr-chip{display:flex;align-items:center;gap:6px;font-family:Consolas,ui-monospace,monospace;font-size:11.5px;color:var(--tx);background:var(--s2);border:1px solid var(--bd);border-radius:999px;padding:4px 5px 4px 10px}
+.qr-chip-remove{width:16px;height:16px;display:grid;place-items:center;font:12px/1 inherit;color:var(--mu);background:var(--s3);border:none;border-radius:999px;cursor:pointer}
+
+.qr-hotkey{background:var(--s1);border:1px solid var(--bd);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px}
+.qr-hotkey-head{display:flex;align-items:center;gap:8px}
+.qr-hotkey-state{font-size:10px;letter-spacing:.05em;text-transform:uppercase}
+.qr-hotkey-row{display:flex;gap:7px}
+.qr-hotkey-select{flex:0 0 92px;appearance:none;font-family:Consolas,ui-monospace,monospace;font-size:12.5px;color:var(--tx);background:var(--s2);border:1px solid var(--bd);border-radius:7px;padding:8px 10px;cursor:pointer}
+.qr-hotkey-run{flex:1;font:600 12.5px/1 inherit;border-radius:7px;padding:9px 0;cursor:pointer;border:1px solid transparent}
+.qr-hotkey-grid{display:grid;grid-template-columns:64px 1fr;gap:7px;align-items:center}
+.qr-hotkey-grid label{font-size:11.5px;color:var(--mu)}
+.qr-hotkey-grid input{min-width:0;font-family:Consolas,ui-monospace,monospace;font-size:12.5px;color:var(--tx);background:var(--s2);border:1px solid var(--bd);border-radius:7px;padding:7px 10px}
+input:focus,select:focus{outline:none;border-color:var(--ac)}
+
+.qr-status{display:flex;align-items:center;gap:8px;padding:9px 11px;border-radius:8px}
+.qr-status-dot{width:6px;height:6px;border-radius:999px;flex:none}
+.qr-status-text{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+@keyframes qr-pulse{0%,100%{opacity:1}50%{opacity:.45}}
+.qr-monitor-notice{display:flex;align-items:flex-start;gap:9px;text-align:left;width:100%;background:var(--wnbg);border:1px solid var(--wn);border-radius:8px;padding:10px 11px;cursor:pointer;color:var(--tx)}
+.qr-monitor-notice-dot{width:6px;height:6px;border-radius:999px;flex:none;margin-top:5px;background:var(--wn);animation:qr-pulse 2s infinite}
+.qr-monitor-notice-title{font-size:11.5px;font-weight:600;color:var(--wn)}
+.qr-monitor-notice-body{font-size:11px;color:var(--mu);line-height:1.35}
+
+.qr-actionbar{display:flex;align-items:center;gap:4px;padding:9px 10px;border-top:1px solid var(--bd);background:var(--s1)}
+.qr-actionbar button{font:11.5px/1 inherit;color:var(--mu);background:transparent;border:1px solid transparent;border-radius:6px;padding:7px 9px;cursor:pointer}
+.qr-actionbar button:hover{background:var(--s2)}
+.qr-actionbar a{font:11.5px/1 inherit;color:var(--mu);text-decoration:none;padding:7px 8px;cursor:pointer}
+
+.qr-overlay{position:absolute;inset:0;background:rgba(4,6,9,.6);backdrop-filter:blur(7px);display:flex;flex-direction:column;padding:14px}
+.qr-overlay.qr-overlay-center{align-items:center;justify-content:center}
+.qr-modal{display:flex;flex-direction:column;min-height:0;flex:1;background:var(--s1);border:1px solid var(--bd2);border-radius:12px;box-shadow:var(--sh);overflow:hidden}
+.qr-modal-head{display:flex;align-items:center;gap:8px;padding:12px 13px;border-bottom:1px solid var(--bd)}
+.qr-modal-title{font-size:13.5px;font-weight:650}
+.qr-modal-sub{font-family:Consolas,ui-monospace,monospace;font-size:10px;color:var(--mu)}
+.qr-modal-close{width:24px;height:24px;display:grid;place-items:center;font:13px/1 inherit;color:var(--mu);background:var(--s2);border:1px solid var(--bd);border-radius:6px;cursor:pointer}
+
+.qr-faq-item{border:1px solid var(--bd);border-radius:8px;background:var(--s2);overflow:hidden}
+.qr-faq-q{display:flex;align-items:flex-start;gap:8px;width:100%;text-align:left;background:transparent;border:none;padding:10px 11px;cursor:pointer;color:var(--tx)}
+.qr-faq-q-text{flex:1;font-size:12px;font-weight:600;line-height:1.35}
+.qr-faq-q-sign{font-family:Consolas,ui-monospace,monospace;font-size:12px;color:var(--ac)}
+.qr-faq-a{margin:0;padding:0 11px 11px;font-size:11.5px;line-height:1.5;color:var(--mu);white-space:pre-line}
+
+.qr-monitor-row{border:1px solid var(--bd);border-radius:9px;background:var(--s2);padding:10px 11px;display:flex;flex-direction:column;gap:9px}
+.qr-monitor-top{display:flex;align-items:center;gap:9px}
+.qr-monitor-name-wrap{display:grid;gap:3px;flex:1;min-width:0}
+.qr-monitor-name{font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qr-monitor-detail{font-family:Consolas,ui-monospace,monospace;font-size:10px;color:var(--mu)}
+.qr-monitor-badge{font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:999px;border:1px solid}
+.qr-monitor-action{font:600 11px/1 inherit;border-radius:6px;padding:7px 10px;cursor:pointer;border:1px solid}
+.qr-monitor-action:disabled{opacity:.5;cursor:not-allowed}
+
+.qr-revert{border:1px solid var(--er);background:var(--erbg);border-radius:8px;padding:10px}
+.qr-revert-head{display:flex;align-items:center;gap:8px;margin-bottom:9px}
+.qr-revert-title{font-size:11.5px;font-weight:700;color:var(--er);flex:1}
+.qr-revert-countdown{font-family:Consolas,ui-monospace,monospace;font-size:15px;font-weight:700;color:var(--er)}
+.qr-revert-body{margin:0 0 9px;font-size:11px;line-height:1.45;color:var(--mu)}
+.qr-revert-actions{display:flex;gap:7px}
+.qr-revert-keep{flex:1;font:600 11.5px/1 inherit;color:var(--tx);background:var(--s3);border:1px solid var(--bd2);border-radius:7px;padding:9px 0;cursor:pointer}
+.qr-revert-now{flex:1;font:700 11.5px/1 inherit;color:#160406;background:var(--er);border:none;border-radius:7px;padding:9px 0;cursor:pointer}
+
+.qr-dialog{background:var(--s1);border:1px solid var(--bd2);border-radius:12px;box-shadow:var(--sh);padding:16px;display:flex;flex-direction:column;gap:12px;max-width:340px}
+.qr-dialog-head{display:flex;align-items:flex-start;gap:9px}
+.qr-dialog-dot{width:7px;height:7px;border-radius:999px;flex:none;margin-top:6px;background:var(--er)}
+.qr-dialog-title{font-size:13px;font-weight:650}
+.qr-dialog-body{font-size:11.5px;line-height:1.5;color:var(--mu)}
+.qr-dialog-body b{font-family:Consolas,ui-monospace,monospace;color:var(--tx)}
+.qr-driver-btn{font:600 12px/1 inherit;color:var(--tx);background:var(--s2);border:1px solid var(--bd2);border-radius:7px;padding:10px;cursor:pointer;text-align:left}
+.qr-dialog-cancel{font:12px/1 inherit;color:var(--mu);background:transparent;border:1px solid var(--bd);border-radius:7px;padding:9px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="qr-app" id="qrApp" data-theme="dark">
+
+  <header class="qr-titlebar">
+    <button class="qr-logo" id="qrLogo">
+      <span class="qr-logo-dot"></span>
+      <span class="qr-logo-text">QuickRes</span>
+    </button>
+    <span class="qr-version" id="qrVersion">v1.0.5</span>
+    <span style="flex:1"></span>
+    <button class="qr-theme-toggle" id="qrThemeToggle">Light theme</button>
+  </header>
+
+  <div class="qr-scroll" id="qrScroll">
+
+    <section class="qr-quick">
+      <div class="qr-section-head">
+        <span class="qr-eyebrow">Quick resolutions</span>
+        <span class="qr-rule"></span>
+      </div>
+      <div class="qr-res-grid" id="qrResGrid"></div>
+    </section>
+
+    <section class="qr-custom">
+      <div class="qr-section-head">
+        <span class="qr-eyebrow">Custom resolution</span>
+        <span class="qr-rule"></span>
+        <span class="qr-eyebrow" id="qrCustomCount">0/6</span>
+      </div>
+      <div class="qr-custom-row">
+        <input class="qr-custom-input" id="qrCustomInput" placeholder="e.g. 1152x864" />
+        <button class="qr-custom-apply" id="qrCustomApply">Apply</button>
+      </div>
+      <div class="qr-custom-list" id="qrCustomList"></div>
+    </section>
+
+    <section class="qr-hotkey">
+      <div class="qr-hotkey-head">
+        <span class="qr-eyebrow">Hotkey toggle</span>
+        <span class="qr-rule"></span>
+        <span class="qr-hotkey-state" id="qrHotkeyState">Stopped</span>
+      </div>
+      <div class="qr-hotkey-row">
+        <select class="qr-hotkey-select" id="qrHotkeySelect"></select>
+        <button class="qr-hotkey-run" id="qrHotkeyRun">Start hotkey</button>
+      </div>
+      <div class="qr-hotkey-grid">
+        <label>Native</label>
+        <input id="qrNativeInput" list="qrResList" />
+        <label>Stretched</label>
+        <input id="qrStretchedInput" list="qrResList" />
+      </div>
+      <datalist id="qrResList"></datalist>
+    </section>
+
+    <div class="qr-status" id="qrStatus" style="display:none">
+      <span class="qr-status-dot" id="qrStatusDot"></span>
+      <span class="qr-status-text" id="qrStatusText"></span>
+    </div>
+
+    <button class="qr-monitor-notice" id="qrMonitorNotice" style="display:none">
+      <span class="qr-monitor-notice-dot"></span>
+      <span style="display:grid;gap:2px">
+        <span class="qr-monitor-notice-title">A monitor may still be disabled</span>
+        <span class="qr-monitor-notice-body" id="qrMonitorNoticeBody"></span>
+      </span>
+    </button>
+  </div>
+
+  <nav class="qr-actionbar">
+    <button id="qrOpenFaq">FAQ</button>
+    <button id="qrOpenMonitors">Monitors</button>
+    <button id="qrCheckUpdates">Updates</button>
+    <span style="flex:1"></span>
+    <a id="qrGithub">GitHub &#8599;</a>
+  </nav>
+
+  <div class="qr-overlay" id="qrFaqOverlay" style="display:none">
+    <div class="qr-modal">
+      <div class="qr-modal-head">
+        <span class="qr-modal-title">FAQ</span>
+        <span style="flex:1"></span>
+        <button class="qr-modal-close" data-close>&times;</button>
+      </div>
+      <div class="qr-scroll" id="qrFaqList" style="padding:10px 12px 14px;gap:6px"></div>
+    </div>
+  </div>
+
+  <div class="qr-overlay" id="qrMonitorsOverlay" style="display:none">
+    <div class="qr-modal">
+      <div class="qr-modal-head">
+        <span class="qr-modal-title">Monitors</span>
+        <span class="qr-modal-sub" id="qrMonitorsCount"></span>
+        <span style="flex:1"></span>
+        <button class="qr-modal-close" data-close>&times;</button>
+      </div>
+      <div class="qr-scroll" id="qrMonitorsList" style="padding:10px 12px 12px;gap:7px"></div>
+    </div>
+  </div>
+
+  <div class="qr-overlay qr-overlay-center" id="qrNotFoundOverlay" style="display:none">
+    <div class="qr-dialog">
+      <div class="qr-dialog-head">
+        <span class="qr-dialog-dot"></span>
+        <span style="display:grid;gap:5px">
+          <span class="qr-dialog-title">Resolution not found</span>
+          <span class="qr-dialog-body" id="qrNotFoundBody"></span>
+        </span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px" id="qrDriverButtons"></div>
+      <button class="qr-dialog-cancel" data-close>Cancel</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const els = id => document.getElementById(id);
+  const app = els("qrApp");
+
+  window.onerror = function (msg) {
+    const box = els("qrStatus");
+    if (box) {
+      box.style.display = "flex";
+      box.style.background = "var(--erbg)";
+      els("qrStatusText").style.color = "var(--er)";
+      els("qrStatusText").textContent = "JS error: " + msg;
+    }
+  };
+
+  const STATUS_KIND = {
+    ok: { fg: "var(--ok)", bg: "var(--okbg)", bd: "var(--ok)" },
+    err: { fg: "var(--er)", bg: "var(--erbg)", bd: "var(--er)" },
+    idle: { fg: "var(--mu)", bg: "var(--s2)", bd: "var(--bd)" },
+  };
+
+  const state = {
+    theme: "dark",
+    quick: [],
+    customs: [],
+    hotkeyOptions: [],
+    hotkeyRunning: false,
+    faq: [],
+    faqOpenIndex: -1,
+    monitors: [],
+    confirmInstanceId: null,
+    countdown: 10,
+    gpuVendors: [],
+  };
+
+  let countdownTimer = null;
+
+  function api() {
+    return window.pywebview && window.pywebview.api;
+  }
+
+  // ---- theme ----
+  function applyTheme() {
+    app.dataset.theme = state.theme;
+    els("qrThemeToggle").textContent = state.theme === "dark" ? "Light theme" : "Dark theme";
+  }
+  function toggleTheme() {
+    state.theme = state.theme === "dark" ? "light" : "dark";
+    applyTheme();
+    if (api()) api().set_theme(state.theme);
+  }
+
+  // ---- status ----
+  function pushStatus(text, kind) {
+    const st = STATUS_KIND[kind] || STATUS_KIND.idle;
+    const box = els("qrStatus");
+    box.style.display = "flex";
+    box.style.background = st.bg;
+    box.style.border = "1px solid " + st.bd;
+    els("qrStatusDot").style.background = st.fg;
+    const t = els("qrStatusText");
+    t.style.color = st.fg;
+    t.textContent = text;
+  }
+  window.qrPushStatus = pushStatus;
+
+  // ---- quick resolutions ----
+  function renderQuick() {
+    const grid = els("qrResGrid");
+    grid.innerHTML = "";
+    state.quick.forEach(r => {
+      const btn = document.createElement("button");
+      btn.className = "qr-res";
+      btn.innerHTML =
+        '<span class="qr-res-value">' + r.res + '</span>' +
+        '<span class="qr-res-tag" style="color:' + (r.tag === "Native" ? "var(--ac)" : "var(--mu)") + '">' +
+        r.tag + " &middot; " + r.ratio + "</span>";
+      btn.addEventListener("click", () => pickResolution(r.width, r.height));
+      grid.appendChild(btn);
+    });
+  }
+
+  function pickResolution(width, height) {
+    if (!api()) return;
+    api().pick_resolution(width, height).then(result => {
+      if (result.ok) {
+        pushStatus(result.message, "ok");
+      } else if (result.reason === "unsupported") {
+        openNotFound(width, height, result.vendors);
+      } else {
+        pushStatus(result.message, "err");
+      }
+    });
+  }
+
+  // ---- custom resolutions ----
+  function renderCustoms() {
+    els("qrCustomCount").textContent = state.customs.length + "/6";
+    const list = els("qrCustomList");
+    list.innerHTML = "";
+    state.customs.forEach(res => {
+      const chip = document.createElement("span");
+      chip.className = "qr-chip";
+      chip.textContent = res;
+      const btn = document.createElement("button");
+      btn.className = "qr-chip-remove";
+      btn.textContent = "×";
+      btn.addEventListener("click", ev => {
+        ev.stopPropagation();
+        if (!api()) return;
+        api().remove_custom(res).then(customs => {
+          state.customs = customs;
+          renderCustoms();
+          syncResDatalist();
+          pushStatus("Removed " + res + " from custom list", "ok");
+        });
+      });
+      chip.appendChild(btn);
+      chip.addEventListener("click", () => {
+        const [w, h] = res.split("x").map(Number);
+        pickResolution(w, h);
+      });
+      list.appendChild(chip);
+    });
+  }
+
+  function addCustom() {
+    const input = els("qrCustomInput");
+    const text = input.value.trim();
+    if (!api()) return;
+    api().add_custom(text).then(result => {
+      if (result.customs) {
+        state.customs = result.customs;
+        renderCustoms();
+        syncResDatalist();
+      }
+      if (result.ok) {
+        input.value = "";
+        pushStatus(result.message, "ok");
+      } else if (result.reason === "unsupported") {
+        openNotFound(result.width, result.height, result.vendors);
+        input.value = "";
+      } else {
+        pushStatus(result.message, "err");
+      }
+    });
+  }
+
+  // ---- hotkey ----
+  function renderHotkeyOptions() {
+    const sel = els("qrHotkeySelect");
+    sel.innerHTML = "";
+    state.hotkeyOptions.forEach(k => {
+      const opt = document.createElement("option");
+      opt.value = k;
+      opt.textContent = k;
+      sel.appendChild(opt);
+    });
+  }
+
+  function syncResDatalist() {
+    const dl = els("qrResList");
+    dl.innerHTML = "";
+    const seen = new Set();
+    state.quick.map(r => r.res).concat(state.customs).forEach(res => {
+      if (seen.has(res)) return;
+      seen.add(res);
+      const opt = document.createElement("option");
+      opt.value = res;
+      dl.appendChild(opt);
+    });
+  }
+
+  function setHotkeyUi(running) {
+    state.hotkeyRunning = running;
+    els("qrHotkeyState").textContent = running ? "Listening" : "Stopped";
+    els("qrHotkeyState").style.color = running ? "var(--ok)" : "var(--mu)";
+    const btn = els("qrHotkeyRun");
+    btn.textContent = running ? "Stop hotkey" : "Start hotkey";
+    btn.style.color = running ? "var(--er)" : "#06141a";
+    btn.style.background = running ? "var(--erbg)" : "var(--ac)";
+    btn.style.borderColor = running ? "var(--er)" : "transparent";
+  }
+
+  function toggleHotkeyRun() {
+    if (!api()) return;
+    if (state.hotkeyRunning) {
+      api().stop_hotkey().then(() => {
+        setHotkeyUi(false);
+        pushStatus("Hotkey stopped", "ok");
+      });
+      return;
+    }
+    const key = els("qrHotkeySelect").value;
+    const native = els("qrNativeInput").value.trim();
+    const stretched = els("qrStretchedInput").value.trim();
+    api().start_hotkey(key, native, stretched).then(result => {
+      if (result.ok) {
+        setHotkeyUi(true);
+      } else {
+        pushStatus(result.message, "err");
+      }
+    });
+  }
+
+  // ---- FAQ ----
+  function renderFaq() {
+    const list = els("qrFaqList");
+    list.innerHTML = "";
+    state.faq.forEach((item, i) => {
+      const wrap = document.createElement("div");
+      wrap.className = "qr-faq-item";
+      const q = document.createElement("button");
+      q.className = "qr-faq-q";
+      const open = state.faqOpenIndex === i;
+      q.innerHTML =
+        '<span class="qr-faq-q-text">' + item.q + '</span>' +
+        '<span class="qr-faq-q-sign">' + (open ? "−" : "+") + '</span>';
+      q.addEventListener("click", () => {
+        state.faqOpenIndex = open ? -1 : i;
+        renderFaq();
+      });
+      wrap.appendChild(q);
+      if (open) {
+        const a = document.createElement("p");
+        a.className = "qr-faq-a";
+        a.textContent = item.a;
+        wrap.appendChild(a);
+      }
+      list.appendChild(wrap);
+    });
+  }
+
+  // ---- monitors ----
+  function renderMonitors() {
+    els("qrMonitorsCount").textContent = state.monitors.length + " detected";
+    const list = els("qrMonitorsList");
+    list.innerHTML = "";
+    const locked = state.monitorOpInFlight || state.confirmInstanceId != null;
+    state.monitors.forEach(m => {
+      const row = document.createElement("div");
+      row.className = "qr-monitor-row";
+      const on = m.is_enabled;
+      const top = document.createElement("div");
+      top.className = "qr-monitor-top";
+      top.innerHTML =
+        '<span class="qr-monitor-name-wrap">' +
+        '<span class="qr-monitor-name">' + m.friendly_name + '</span>' +
+        '<span class="qr-monitor-detail">' + (m.is_primary ? "Primary display" : "Secondary display") + '</span>' +
+        '</span>' +
+        '<span class="qr-monitor-badge" style="color:' + (on ? "var(--ok)" : "var(--mu)") +
+        ';background:' + (on ? "var(--okbg)" : "var(--s3)") +
+        ';border-color:' + (on ? "var(--ok)" : "var(--bd)") + '">' + (on ? "Enabled" : "Disabled") + '</span>';
+      const actBtn = document.createElement("button");
+      actBtn.className = "qr-monitor-action";
+      actBtn.textContent = on ? "Disable" : "Enable";
+      actBtn.style.color = on ? "var(--er)" : "var(--tx)";
+      actBtn.style.background = on ? "var(--erbg)" : "var(--s3)";
+      actBtn.style.borderColor = on ? "var(--er)" : "var(--bd2)";
+      actBtn.disabled = locked;
+      actBtn.addEventListener("click", () => monitorAction(m.instance_id));
+      top.appendChild(actBtn);
+      row.appendChild(top);
+
+      if (state.confirmInstanceId === m.instance_id) {
+        const revert = document.createElement("div");
+        revert.className = "qr-revert";
+        revert.innerHTML =
+          '<div class="qr-revert-head"><span class="qr-revert-title">Keep this monitor disabled?</span>' +
+          '<span class="qr-revert-countdown" id="qrCountdown">' + state.countdown + 's</span></div>' +
+          '<p class="qr-revert-body">If you do nothing, QuickRes re-enables it automatically. Use this if your screen went black.</p>' +
+          '<div class="qr-revert-actions">' +
+          '<button class="qr-revert-keep" id="qrKeepDisabled">Keep disabled</button>' +
+          '<button class="qr-revert-now" id="qrRevertNow">Revert now</button>' +
+          '</div>';
+        row.appendChild(revert);
+      }
+      list.appendChild(row);
+    });
+
+    if (state.confirmInstanceId != null) {
+      els("qrKeepDisabled").addEventListener("click", () => {
+        if (!api()) return;
+        api().keep_disabled(state.confirmInstanceId).then(result => {
+          stopCountdown();
+          state.confirmInstanceId = null;
+          pushStatus(result.message, result.kind || "ok");
+          refreshMonitors();
+        });
+      });
+      els("qrRevertNow").addEventListener("click", () => {
+        if (!api()) return;
+        const id = state.confirmInstanceId;
+        stopCountdown();
+        state.confirmInstanceId = null;
+        api().revert_now(id).then(result => {
+          pushStatus(result.message, result.kind || (result.ok ? "ok" : "err"));
+          refreshMonitors();
+        });
+      });
+    }
+  }
+
+  function startCountdown(seconds) {
+    stopCountdown();
+    state.countdown = seconds;
+    countdownTimer = setInterval(() => {
+      state.countdown -= 1;
+      const el = els("qrCountdown");
+      if (el) el.textContent = state.countdown + "s";
+      if (state.countdown <= 0) stopCountdown();
+    }, 1000);
+  }
+  function stopCountdown() {
+    if (countdownTimer) clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+
+  function refreshMonitors() {
+    if (!api()) return;
+    api().list_monitors().then(result => {
+      state.monitors = result.monitors;
+      state.monitorOpInFlight = result.op_in_flight;
+      state.confirmInstanceId = result.confirming_instance_id;
+      renderMonitors();
+      if (state.confirmInstanceId != null) startCountdown(result.countdown || 10);
+      else stopCountdown();
+    });
+  }
+  window.qrOnMonitorsChanged = () => {
+    if (els("qrMonitorsOverlay").style.display !== "none") refreshMonitors();
+  };
+
+  function monitorAction(instanceId) {
+    if (!api()) return;
+    pushStatus("Requesting admin approval...", "idle");
+    api().monitor_action(instanceId).then(result => {
+      pushStatus(result.message, result.kind || (result.ok ? "ok" : "err"));
+      refreshMonitors();
+    });
+  }
+
+  // ---- resolution not found ----
+  function openNotFound(width, height, vendors) {
+    const res = width + "x" + height;
+    els("qrNotFoundBody").innerHTML =
+      '<b>' + res + '</b> isn’t registered with your GPU driver, so Windows can’t switch to it. ' +
+      'Add it as a custom resolution in your driver panel, then try again.';
+    const wrap = els("qrDriverButtons");
+    wrap.innerHTML = "";
+    const labels = { nvidia: "Open NVIDIA Control Panel", amd: "Open AMD Software", intel: "Open Intel Graphics Software" };
+    (vendors && vendors.length ? vendors : ["nvidia", "amd", "intel"]).forEach(v => {
+      const btn = document.createElement("button");
+      btn.className = "qr-driver-btn";
+      btn.textContent = labels[v] || v;
+      btn.addEventListener("click", () => { if (api()) api().open_driver_panel(v); closeModals(); });
+      wrap.appendChild(btn);
+    });
+    show("qrNotFoundOverlay");
+  }
+
+  // ---- modal plumbing ----
+  function show(id) { els(id).style.display = "flex"; }
+  function closeModals() {
+    ["qrFaqOverlay", "qrMonitorsOverlay", "qrNotFoundOverlay"].forEach(id => els(id).style.display = "none");
+  }
+
+  function openFaq() { renderFaq(); show("qrFaqOverlay"); }
+  function openMonitors() { refreshMonitors(); show("qrMonitorsOverlay"); }
+
+  // ---- monitor notice banner ----
+  function renderMonitorNotice(notice) {
+    const btn = els("qrMonitorNotice");
+    if (!notice || !notice.instance_id) {
+      btn.style.display = "none";
+      return;
+    }
+    els("qrMonitorNoticeBody").textContent =
+      notice.friendly_name + " was disabled in a previous session. Click to restore it.";
+    btn.style.display = "flex";
+  }
+
+  // ---- wiring ----
+  function wire() {
+    els("qrLogo").addEventListener("click", () => api() && api().open_external("https://lxzy.my/"));
+    els("qrGithub").addEventListener("click", () => api() && api().open_external("https://github.com/lxzydev/QuickRes"));
+    els("qrThemeToggle").addEventListener("click", toggleTheme);
+    els("qrCustomApply").addEventListener("click", addCustom);
+    els("qrCustomInput").addEventListener("keydown", e => { if (e.key === "Enter") addCustom(); });
+    els("qrHotkeyRun").addEventListener("click", toggleHotkeyRun);
+    els("qrOpenFaq").addEventListener("click", openFaq);
+    els("qrOpenMonitors").addEventListener("click", openMonitors);
+    els("qrCheckUpdates").addEventListener("click", () => {
+      if (!api()) return;
+      api().check_updates().then(result => {
+        if (result.kind === "available") {
+          if (confirm(result.message + "\n\nUpdate now?")) {
+            pushStatus("Downloading update...", "idle");
+            api().confirm_update(result.url);
+          }
+          return;
+        }
+        pushStatus(result.message, result.kind || "idle");
+      });
+    });
+    els("qrMonitorNotice").addEventListener("click", () => {
+      if (!api()) return;
+      pushStatus("Restoring...", "idle");
+      api().restore_pending().then(result => {
+        pushStatus(result.message, result.kind || (result.ok ? "ok" : "err"));
+        if (result.ok) renderMonitorNotice(null);
+      });
+    });
+    document.querySelectorAll("[data-close]").forEach(btn => btn.addEventListener("click", closeModals));
+    document.querySelectorAll(".qr-overlay").forEach(overlay => {
+      overlay.addEventListener("click", e => { if (e.target === overlay) closeModals(); });
+    });
+  }
+
+  function boot(initial) {
+    state.theme = initial.theme;
+    state.quick = initial.quick;
+    state.customs = initial.customs;
+    state.hotkeyOptions = initial.hotkeyOptions;
+    state.faq = initial.faq;
+
+    els("qrVersion").textContent = "v" + initial.version;
+    applyTheme();
+    renderQuick();
+    renderCustoms();
+    renderHotkeyOptions();
+    syncResDatalist();
+    els("qrHotkeySelect").value = initial.hotkey;
+    els("qrNativeInput").value = initial.native;
+    els("qrStretchedInput").value = initial.stretched;
+    setHotkeyUi(false);
+    renderMonitorNotice(initial.monitorNotice);
+    wire();
+  }
+
+  let booted = false;
+  function init() {
+    if (booted) return;
+    if (!api()) { setTimeout(init, 50); return; }
+    booted = true;
+    api().get_initial_state().then(boot).catch(err => {
+      pushStatus("Startup error: " + (err && err.message ? err.message : err), "err");
+    });
+  }
+
+  window.addEventListener("pywebviewready", init);
+  // Fallback in case the event already fired before this script attached.
+  setTimeout(init, 300);
+})();
+</script>
+</body>
+</html>

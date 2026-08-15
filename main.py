@@ -35,8 +35,7 @@ if __name__ == "__main__":
         sys.exit(0 if ok else 1)
 
     from quickres.config import enforce_single_instance
-    from quickres.gui import ResSwitcherApp
+    from quickres.webview.app import run_app
 
     _mutex_handle = enforce_single_instance()
-    app = ResSwitcherApp()
-    app.mainloop()
+    run_app()
