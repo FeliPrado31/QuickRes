@@ -14,10 +14,10 @@ HOW THIS WORKS:
 FOR TRANSLATORS:
 Only edit the STRINGS["ru"] block below. It has the same keys, in the same
 order, as STRINGS["en"] above it, just scroll up to see the English text
-for whatever key you're on. 
+for whatever key you're on.
 
 Leave STRINGS["en"] and everything else in
-this file untouched. 
+this file untouched.
 
 Keep any {word} placeholders exactly as they appear
 in the English version (e.g. {name}, {seconds}), just move them to
@@ -46,14 +46,12 @@ STRINGS = {
         "btn_settings": "Settings",
         "btn_github": "GitHub",
         "restore_banner_text": "A monitor may still be disabled from a previous session - click to restore it",
-
         # --- Status messages (main window) ---
         "status_custom_cleared": "Custom resolutions cleared",
         "status_hotkey_stopped": "Hotkey: stopped",
         "status_res_format_error": "Native/Stretched must look like 1920x1080",
         "status_custom_format_error": "Format like 1440x1080",
         "status_removed_custom": "Removed {res} from custom list",
-
         # --- Resolution-not-found dialog ---
         "dialog_res_not_found_title": "Resolution not found",
         "dialog_res_not_found_body": (
@@ -64,11 +62,10 @@ STRINGS = {
         "btn_amd_software": "AMD Software",
         "btn_intel_graphics": "Intel Graphics Software",
         "btn_cancel": "Cancel",
-
         # --- FAQ window ---
         "faq_window_title": "FAQ",
         "btn_close": "Close",
-        "faq_q1": "Why does it say \"Resolution not found\"?",
+        "faq_q1": 'Why does it say "Resolution not found"?',
         "faq_a1": (
             "QuickRes checks your GPU driver's list of registered resolutions "
             "before switching. If a resolution isn't on that list, Windows has "
@@ -100,7 +97,6 @@ STRINGS = {
             "Press it once on the fill/agent select screen to go stretched, "
             "press it again after the match to go back to native.\n\n"
         ),
-
         # --- Settings window ---
         "settings_window_title": "Settings",
         "settings_theme_label": "Theme:",
@@ -109,7 +105,6 @@ STRINGS = {
         "btn_reset_custom_res": "Reset Custom Resolutions",
         "btn_check_update": "Check for Update",
         "settings_language_label": "Language:",
-
         # --- Monitors window ---
         "monitors_window_title": "Monitors",
         "monitors_none_found": "No monitors found.",
@@ -133,7 +128,6 @@ STRINGS = {
             "check again in a moment."
         ),
         "status_enable_unconfirmed": "{name} enabled (result was unconfirmed, verified by re-check)",
-
         # --- Revert / keep-disabled dialog ---
         "revert_dialog_title": "Keep this monitor disabled?",
         "revert_countdown": "Reverting in {seconds}s",
@@ -148,7 +142,6 @@ STRINGS = {
         "status_reverted": "Reverted {name}",
         "status_reverted_unconfirmed": "Reverted {name} (result was unconfirmed, verified by re-check)",
         "status_revert_failed": "Failed to revert {name}: {message}. Please retry manually.",
-
         # --- Restore-on-startup flow ---
         "status_restoring": "Restoring {name}...",
         "status_restore_pending": (
@@ -160,95 +153,129 @@ STRINGS = {
         "status_restore_failed": "Failed to restore {name}: {message}. Please retry manually.",
         "status_unexpected_error": "Unexpected error: {error}",
     },
-
     "ru": {
         # --- Main window ---
-        "app_title": "",
-        "custom_resolution_label": "",
-        "custom_res_placeholder": "",
-        "btn_apply": "",
-        "hotkey_toggle_label": "",
-        "hotkey_label": "",
-        "btn_start_hotkey": "",
-        "btn_stop_hotkey": "",
-        "native_label": "",
-        "stretched_label": "",
-        "btn_faq": "",
-        "btn_monitors": "",
-        "btn_settings": "",
-        "btn_github": "",
-        "restore_banner_text": "",
-
+        "app_title": "QuickRes",
+        "custom_resolution_label": "Пользовательское разрешение",
+        "custom_res_placeholder": "например, 1440x1080",
+        "btn_apply": "Применить",
+        "hotkey_toggle_label": "Горячая клавиша",
+        "hotkey_label": "Горячая клавиша:",
+        "btn_start_hotkey": "Включить",
+        "btn_stop_hotkey": "Отключить",
+        "native_label": "Нативное:",
+        "stretched_label": "Растянутое:",
+        "btn_faq": "FAQ",
+        "btn_monitors": "Мониторы",
+        "btn_settings": "Настройки",
+        "btn_github": "GitHub",
+        "restore_banner_text": "Монитор мог остаться отключённым после предыдущего запуска - нажмите, чтобы восстановить его",
         # --- Status messages (main window) ---
-        "status_custom_cleared": "",
-        "status_hotkey_stopped": "",
-        "status_res_format_error": "",
-        "status_custom_format_error": "",
-        "status_removed_custom": "",
-
+        "status_custom_cleared": "Пользовательские разрешения сброшены",
+        "status_hotkey_stopped": "Горячая клавиша: отключена",
+        "status_res_format_error": "Нативное и растянутое разрешения должны быть указаны в формате 1920x1080",
+        "status_custom_format_error": "Укажите разрешение в формате 1440x1080",
+        "status_removed_custom": "{res} удалено из списка пользовательских разрешений",
         # --- Resolution-not-found dialog ---
-        "dialog_res_not_found_title": "",
-        "dialog_res_not_found_body": "",
-        "btn_nvidia_panel": "",
-        "btn_amd_software": "",
-        "btn_intel_graphics": "",
-        "btn_cancel": "",
-
+        "dialog_res_not_found_title": "Разрешение не найдено",
+        "dialog_res_not_found_body": (
+            "Не удалось найти разрешение {width} x {height} в списке драйвера видеокарты.\n\n"
+            "Открыть программу управления графикой, чтобы добавить его?"
+        ),
+        "btn_nvidia_panel": "Панель управления NVIDIA",
+        "btn_amd_software": "AMD Software",
+        "btn_intel_graphics": "Intel Graphics Software",
+        "btn_cancel": "Отмена",
         # --- FAQ window ---
-        "faq_window_title": "",
-        "btn_close": "",
-        "faq_q1": "",
-        "faq_a1": "",
-        "faq_q2": "",
-        "faq_a2": "",
-        "faq_q3": "",
-        "faq_a3": "",
-        "faq_q4": "",
-        "faq_a4": "",
-
+        "faq_window_title": "FAQ",
+        "btn_close": "Закрыть",
+        "faq_q1": "Почему появляется сообщение «Разрешение не найдено»?",
+        "faq_a1": (
+            "Перед переключением QuickRes проверяет список разрешений, зарегистрированных "
+            "в драйвере видеокарты. Если нужного разрешения в списке нет, Windows пока "
+            "не сможет на него переключиться.\n\n"
+            "В таком случае QuickRes показывает окно с кнопкой для программы управления "
+            "графикой: Панель управления NVIDIA, AMD Software или Intel Graphics Software, "
+            "в зависимости от того, что обнаружено на вашем компьютере. Нажмите кнопку "
+            "и добавьте нужное разрешение как пользовательское:\n\n"
+            "NVIDIA: Дисплей > Изменение разрешения > Настройка > "
+            "Создать пользовательское разрешение\n\n"
+            "AMD: Дисплей > Пользовательские разрешения > Создать новое\n\n"
+            "Intel: Дисплей > Общие > Разрешение > + (создать пользовательский профиль)"
+        ),
+        "faq_q2": "Почему ничего не происходит при нажатии на кнопку?",
+        "faq_a2": "Попробуйте запустить QuickRes от имени администратора.",
+        "faq_q3": "После переключения изображение выглядит неправильно? (Valorant)",
+        "faq_a3": (
+            "Перед переключением на растянутое разрешение убедитесь, что Valorant находится "
+            "на экране выбора агента. Это нужно делать перед каждым матчем, поскольку при "
+            "загрузке новой игры разрешение сбрасывается, а слишком раннее переключение "
+            "может привести к появлению чёрных полос. Настройте горячую клавишу ниже, чтобы "
+            "переключаться между нативным и растянутым разрешением одним нажатием, не открывая "
+            "каждый раз приложение."
+        ),
+        "faq_q4": "Что делает горячая клавиша?",
+        "faq_a4": (
+            "После нажатия «Включить» выбранная клавиша будет переключать экран между "
+            "указанными выше нативным и растянутым разрешениями. Нажмите её один раз "
+            "на экране выбора агента, чтобы перейти на растянутое разрешение, и ещё раз "
+            "после матча, чтобы вернуться к нативному.\n\n"
+        ),
         # --- Settings window ---
-        "settings_window_title": "",
-        "settings_theme_label": "",
-        "theme_light": "",
-        "theme_dark": "",
-        "btn_reset_custom_res": "",
-        "btn_check_update": "",
-        "settings_language_label": "",
-
+        "settings_window_title": "Настройки",
+        "settings_theme_label": "Тема:",
+        "theme_light": "Светлая",
+        "theme_dark": "Тёмная",
+        "btn_reset_custom_res": "Сбросить пользовательские разрешения",
+        "btn_check_update": "Проверить обновления",
+        "settings_language_label": "Язык:",
         # --- Monitors window ---
-        "monitors_window_title": "",
-        "monitors_none_found": "",
-        "monitor_status_enabled": "",
-        "monitor_status_disabled": "",
-        "btn_disable": "",
-        "btn_enable": "",
-        "status_write_flag_failed": "",
-        "status_requesting_disable": "",
-        "status_requesting_enable": "",
-        "status_disable_pending": "",
-        "status_disable_unconfirmed": "",
-        "status_enable_pending": "",
-        "status_enable_unconfirmed": "",
-
+        "monitors_window_title": "Мониторы",
+        "monitors_none_found": "Мониторы не найдены.",
+        "monitor_status_enabled": "Включён",
+        "monitor_status_disabled": "Отключён",
+        "btn_disable": "Отключить",
+        "btn_enable": "Включить",
+        "status_write_flag_failed": (
+            "Не удалось записать флаг восстановления после сбоя, поэтому {name} не будет отключён. "
+            "Проверьте свободное место на диске и права доступа, затем повторите попытку."
+        ),
+        "status_requesting_disable": "Запрашивается разрешение администратора на отключение {name}...",
+        "status_requesting_enable": "Запрашивается разрешение администратора на включение {name}...",
+        "status_disable_pending": (
+            "Ожидание разрешения администратора на отключение {name} продолжается. "
+            "Через некоторое время снова откройте раздел «Мониторы», чтобы увидеть фактическое состояние."
+        ),
+        "status_disable_unconfirmed": "{name} отключён (результат не был подтверждён напрямую, состояние проверено повторно)",
+        "status_enable_pending": (
+            "Ожидание разрешения администратора на включение {name} продолжается. "
+            "Проверьте состояние ещё раз через некоторое время."
+        ),
+        "status_enable_unconfirmed": "{name} включён (результат не был подтверждён напрямую, состояние проверено повторно)",
         # --- Revert / keep-disabled dialog ---
-        "revert_dialog_title": "",
-        "revert_countdown": "",
-        "btn_keep_disabled": "",
-        "btn_revert_now": "",
-        "status_reverting": "",
-        "status_revert_pending": "",
-        "status_device_gone": "",
-        "status_reverted": "",
-        "status_reverted_unconfirmed": "",
-        "status_revert_failed": "",
-
+        "revert_dialog_title": "Оставить этот монитор отключённым?",
+        "revert_countdown": "Восстановление через {seconds} с",
+        "btn_keep_disabled": "Оставить отключённым",
+        "btn_revert_now": "Восстановить сейчас",
+        "status_reverting": "Восстановление {name}...",
+        "status_revert_pending": (
+            "Ожидание разрешения администратора на восстановление {name} продолжается. "
+            "Проверьте состояние ещё раз через некоторое время."
+        ),
+        "status_device_gone": "{name} больше не обнаружен в системе. Устаревший флаг восстановления удалён.",
+        "status_reverted": "{name} восстановлен",
+        "status_reverted_unconfirmed": "{name} восстановлен (результат не был подтверждён напрямую, состояние проверено повторно)",
+        "status_revert_failed": "Не удалось восстановить {name}: {message}. Повторите попытку вручную.",
         # --- Restore-on-startup flow ---
-        "status_restoring": "",
-        "status_restore_pending": "",
-        "status_restored": "",
-        "status_restored_unconfirmed": "",
-        "status_restore_failed": "",
-        "status_unexpected_error": "",
+        "status_restoring": "Восстановление {name}...",
+        "status_restore_pending": (
+            "Ожидание разрешения администратора на восстановление {name} продолжается. "
+            "Проверьте состояние ещё раз через некоторое время."
+        ),
+        "status_restored": "{name} восстановлен",
+        "status_restored_unconfirmed": "{name} восстановлен (результат не был подтверждён напрямую, состояние проверено повторно)",
+        "status_restore_failed": "Не удалось восстановить {name}: {message}. Повторите попытку вручную.",
+        "status_unexpected_error": "Непредвиденная ошибка: {error}",
     },
 }
 
@@ -258,7 +285,7 @@ LANGUAGE_NAMES = {
     "ru": "Русский",
 }
 
-_current_lang = "en"
+_current_lang = "auto"
 
 
 def detect_system_language() -> str:
