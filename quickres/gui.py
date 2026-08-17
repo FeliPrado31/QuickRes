@@ -225,10 +225,12 @@ class ResSwitcherApp(tk.Tk):
         self.themed_labels.append(hotkey_label)
         saved_hotkey = cfg.get("hotkey", "F6")
         self.hotkey_var = tk.StringVar(value=saved_hotkey if saved_hotkey in HOTKEY_OPTIONS else "F6")
-        ttk.Combobox(
+        self.hotkey_key_combo = ttk.Combobox(
             hotkey_row, textvariable=self.hotkey_var, values=list(HOTKEY_OPTIONS.keys()),
             width=8, state="readonly"
-        ).pack(side="left", padx=(6, 0))
+        )
+        self.hotkey_key_combo.pack(side="left", padx=(6, 0))
+        self.hotkey_key_combo.bind("<<ComboboxSelected>>", self._on_hotkey_settings_changed)
 
         self.hotkey_btn = tk.Button(hotkey_row, text=t("btn_start_hotkey"), command=self.toggle_hotkey_mode)
         self.hotkey_btn.pack(side="left", padx=(6, 0))
@@ -258,6 +260,9 @@ class ResSwitcherApp(tk.Tk):
             width=11, state="normal"
         )
         self.native_combo.pack(side="left", padx=(6, 0))
+        self.native_combo.bind("<<ComboboxSelected>>", self._on_hotkey_settings_changed)
+        self.native_combo.bind("<Return>", self._on_hotkey_settings_changed)
+        self.native_combo.bind("<FocusOut>", self._on_hotkey_settings_changed)
 
         stretched_row = tk.Frame(footer_frame)
         stretched_row.pack(fill="x", padx=10, pady=(6, 0))
@@ -274,6 +279,9 @@ class ResSwitcherApp(tk.Tk):
             width=11, state="normal"
         )
         self.stretched_combo.pack(side="left", padx=(6, 0))
+        self.stretched_combo.bind("<<ComboboxSelected>>", self._on_hotkey_settings_changed)
+        self.stretched_combo.bind("<Return>", self._on_hotkey_settings_changed)
+        self.stretched_combo.bind("<FocusOut>", self._on_hotkey_settings_changed)
 
         self.status_var = tk.StringVar(value="")
         self.status_label = tk.Label(footer_frame, textvariable=self.status_var, wraplength=250, fg="green")
@@ -706,6 +714,41 @@ class ResSwitcherApp(tk.Tk):
         self.hotkey_toggle.start()
         self.hotkey_running = True
         self.hotkey_btn.config(text=t("btn_stop_hotkey"))
+
+    def _on_hotkey_settings_changed(self, event=None):
+        if not self.hotkey_running or self.hotkey_toggle is None:
+            return
+
+        native = self._parse_res(self.native_var.get())
+        stretched = self._parse_res(self.stretched_var.get())
+        if not native or not stretched:
+            return
+
+        key_name = self.hotkey_var.get()
+        if (
+            native == self.hotkey_toggle.native_res
+            and stretched == self.hotkey_toggle.stretched_res
+            and key_name == self.hotkey_toggle.key_name
+        ):
+            return
+
+        update_config({
+            "hotkey": key_name,
+            "native_res": self.native_var.get(),
+            "stretched_res": self.stretched_var.get()
+        })
+
+        was_stretched = self.hotkey_toggle.is_stretched
+        self.hotkey_toggle.stop()
+
+        self.hotkey_toggle = HotkeyToggle(
+            key_name=key_name,
+            native_res=native,
+            stretched_res=stretched,
+            on_status=self._set_status_threadsafe,
+        )
+        self.hotkey_toggle.is_stretched = was_stretched
+        self.hotkey_toggle.start()
 
     def _set_status_threadsafe(self, message: str):
         self.after(0, lambda: (
