@@ -97,11 +97,16 @@ def _run_elevated_helper(argv) -> int:
                 command = json.load(f)
         except FileNotFoundError:
             last_reason = GUARD_REASON_NO_COMMAND
-        except (OSError, ValueError, json.JSONDecodeError):
-            # Covers both an unreadable read (e.g. a transient sharing
-            # violation racing the atomic replace in bridge.py) and a
-            # malformed one; either way it is ignored and the timeout
-            # remains the fail-safe and will auto-revert.
+        except Exception:
+            # Deliberately catches every exception, not just the
+            # expected (OSError, ValueError, json.JSONDecodeError):
+            # this is a fail-safe boundary that must never let an
+            # unusual command file (a permission/sharing-violation
+            # read racing the atomic replace in config.write_json_atomic,
+            # or pathological JSON like deep nesting raising
+            # RecursionError) crash this still-elevated helper before
+            # it can auto-revert. Any such read is simply ignored and
+            # the timeout remains the fail-safe.
             last_reason = GUARD_REASON_UNREADABLE_COMMAND
         else:
             # A tuple, not a set: an "action" that is a list/dict (valid

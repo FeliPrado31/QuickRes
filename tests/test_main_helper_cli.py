@@ -16,6 +16,11 @@ def _isolated_app_dir(tmp_path, monkeypatch):
     # every test's result_file must live under (a monkeypatched) APP_DIR and
     # match the monitor_op_result_<pid>_<ms>.json shape.
     monkeypatch.setattr(config, "APP_DIR", str(tmp_path))
+    # config.LOG_PATH is computed once at import time from the real APP_DIR,
+    # not re-derived from it -- patching APP_DIR alone leaves log_msg() (hit
+    # by several tests below on the auto-revert path) writing into the
+    # developer's actual %LOCALAPPDATA%\QuickRes\quickres.log.
+    monkeypatch.setattr(config, "LOG_PATH", str(tmp_path / "quickres.log"))
     yield
 
 
@@ -314,6 +319,32 @@ def test_guarded_disable_unhashable_action_value_does_not_crash(monkeypatch, tmp
     assert completion["reason"] == main.GUARD_REASON_INVALID_ACTION
 
 
+def test_guarded_disable_pathological_json_does_not_crash(monkeypatch, tmp_path):
+    # json.load() raises RecursionError on deeply-nested JSON -- a
+    # RuntimeError subclass, not OSError/ValueError/JSONDecodeError. The
+    # read/parse except clause must catch this too (it deliberately
+    # catches Exception broadly), or an adversarial/corrupt command file
+    # crashes this still-elevated helper the same way an unhashable
+    # "action" value did before that was fixed.
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "run_elevated_worker_op",
+        lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
+    )
+    _force_single_poll_timeout(monkeypatch)
+    command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "236")
+    command_file.write_text("[" * 200_000, encoding="utf-8")
+
+    exit_code = main._run_elevated_helper(argv)
+
+    assert exit_code == 0
+    assert calls == [("disable", "A"), ("enable", "A")]
+    completion = json.loads(completion_file.read_text(encoding="utf-8"))
+    assert completion["action"] == "auto_revert"
+    assert completion["reason"] == main.GUARD_REASON_UNREADABLE_COMMAND
+
+
 def test_guarded_disable_reason_reflects_the_most_recent_poll(monkeypatch, tmp_path):
     # last_reason is overwritten every iteration, not OR'd together across
     # the whole window -- a transient bad read on an early poll must not
@@ -354,12 +385,13 @@ def test_guarded_disable_reason_reflects_the_most_recent_poll(monkeypatch, tmp_p
 
 
 def test_guarded_disable_command_file_only_acts_on_the_launched_instance_id(monkeypatch, tmp_path):
-    # The guard loop reads only the "action" field from the command file and
-    # always applies it to the fixed args.instance_id list -- an extraneous
-    # "instance_id" in the command file naming a monitor the helper was never
-    # launched for must not be actionable. This locks in that guarantee: the
-    # command file can smuggle an out-of-scope instance_id but the helper
-    # only ever touches "A" (the one it was launched for), never "B".
+    # The guard loop reads only the "action" field from the command file --
+    # it has no code path that reads command["instance_id"] at all, so an
+    # extraneous "instance_id" naming a monitor the helper was never
+    # launched for is just inert dead data, not something being actively
+    # rejected. This locks in that (currently structural, not enforced)
+    # guarantee: the helper always applies the action to the fixed
+    # args.instance_id list it was launched with ("A"), never to "B".
     calls = []
 
     def worker(op, instance_id):
