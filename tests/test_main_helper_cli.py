@@ -436,8 +436,8 @@ def test_guarded_disable_malformed_command_file_does_not_crash_and_auto_reverts(
     monkeypatch, tmp_path
 ):
     # An unparseable command file (truncated/garbage JSON) must be swallowed
-    # by the loop's (OSError, ValueError, json.JSONDecodeError) guard rather
-    # than propagating -- the loop keeps polling and falls through to the
+    # by the loop's deliberately-broad `except Exception` rather than
+    # propagating -- the loop keeps polling and falls through to the
     # deadline's auto_revert fail-safe, same timeout-forcing technique as
     # test_guarded_disable_auto_reverts_when_no_command_arrives.
     calls = []
