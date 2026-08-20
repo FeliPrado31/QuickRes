@@ -1,6 +1,5 @@
 import ctypes
 import json
-import os
 import sys
 import time
 import traceback
@@ -87,37 +86,46 @@ def _run_elevated_helper(argv) -> int:
     # only keep the already-applied disable or re-enable these exact ids.
     deadline = time.monotonic() + args.guard_timeout_s
     action = None
-    saw_malformed_command = False
-    saw_invalid_action = False
+    last_reason = "no_command"
     while time.monotonic() < deadline:
+        last_reason = "no_command"
         try:
-            if os.path.exists(args.guard_command_file):
-                with open(args.guard_command_file, "r", encoding="utf-8") as f:
-                    command = json.load(f)
-                requested = command.get("action") if isinstance(command, dict) else None
-                if requested in {"keep", "revert"}:
-                    action = requested
-                    break
-                saw_invalid_action = True
+            with open(args.guard_command_file, "r", encoding="utf-8") as f:
+                command = json.load(f)
+        except FileNotFoundError:
+            pass
         except (OSError, ValueError, json.JSONDecodeError):
             # A partially-written/malformed command is ignored; timeout
             # remains the fail-safe and will auto-revert.
-            saw_malformed_command = True
+            last_reason = "malformed_command"
+        else:
+            # `requested` must be checked with isinstance before the `in`
+            # test below: a well-formed JSON command whose "action" is a
+            # list/dict (e.g. {"action": ["revert"]}) is unhashable, and
+            # `in {"keep", "revert"}` would raise TypeError -- uncaught by
+            # the except clause above -- killing this still-elevated
+            # helper before it can write a result or re-enable the
+            # monitor, forcing the separate guard in bridge.py to
+            # re-elevate with a second UAC prompt.
+            requested = command.get("action") if isinstance(command, dict) else None
+            if isinstance(requested, str) and requested in {"keep", "revert"}:
+                action = requested
+                break
+            last_reason = "invalid_action"
         time.sleep(0.05)
 
     reason = None
     if action is None:
         action = "auto_revert"
         # auto_revert fires for three different causes that otherwise look
-        # identical from the result file alone (no command ever arrived vs.
-        # an unreadable/corrupt command file vs. a well-formed but
-        # unrecognized action) -- record which one so a black-screen report
-        # is actually diagnosable instead of just "it reverted".
-        reason = (
-            "malformed_command" if saw_malformed_command
-            else "invalid_action" if saw_invalid_action
-            else "no_command"
-        )
+        # identical from the result file alone: no command file present on
+        # the most recent poll, an unreadable/corrupt read on that poll,
+        # or a well-formed read that was not a recognized keep/revert
+        # action (including a missing or wrong-typed "action" field).
+        # last_reason reflects only the most recent poll outcome, not
+        # the first failure ever seen, so a transient early glitch cannot
+        # mislabel a window that later settled into a different state.
+        reason = last_reason
         log_msg(f"Guard window expired without a valid keep/revert command (reason={reason}); auto-reverting")
 
     completion = {"action": action, "results": []}

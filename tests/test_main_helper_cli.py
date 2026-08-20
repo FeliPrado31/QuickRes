@@ -27,6 +27,30 @@ def _fake_worker_op(results_by_id):
     return worker
 
 
+def _guarded_disable_argv(tmp_path, suffix, *, timeout_s="1"):
+    command_file = tmp_path / f"monitor_guard_command_111_{suffix}.json"
+    completion_file = tmp_path / f"monitor_guard_result_111_{suffix}.json"
+    argv = [
+        "--monitor-op", "guarded-disable",
+        "--instance-id", "A",
+        "--result-file", str(tmp_path / f"monitor_op_result_111_{suffix}.json"),
+        "--guard-command-file", str(command_file),
+        "--guard-result-file", str(completion_file),
+        "--guard-timeout-s", timeout_s,
+    ]
+    return command_file, completion_file, argv
+
+
+def _force_single_poll_timeout(monkeypatch):
+    # Forces exactly one guard-loop iteration to run before the deadline
+    # trips: 3 monotonic() values cover the deadline calculation, one
+    # while-condition check that lets the loop body execute once, and a
+    # final while-condition check that fails and exits the loop.
+    monotonic_values = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+
+
 def test_single_instance_id_produces_one_result_entry(monkeypatch, tmp_path):
     monkeypatch.setattr(
         main, "run_elevated_worker_op", _fake_worker_op({"A": (True, "Disabled")})
@@ -175,21 +199,10 @@ def test_guarded_disable_reuses_the_same_elevated_helper_for_revert(monkeypatch,
         return True, f"{op} {instance_id}"
 
     monkeypatch.setattr(main, "run_elevated_worker_op", worker)
-    result_file = str(tmp_path / "monitor_op_result_111_227.json")
-    command_file = tmp_path / "monitor_guard_command_111_227.json"
-    completion_file = tmp_path / "monitor_guard_result_111_227.json"
+    command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "227")
     command_file.write_text(json.dumps({"action": "revert"}), encoding="utf-8")
 
-    exit_code = main._run_elevated_helper(
-        [
-            "--monitor-op", "guarded-disable",
-            "--instance-id", "A",
-            "--result-file", result_file,
-            "--guard-command-file", str(command_file),
-            "--guard-result-file", str(completion_file),
-            "--guard-timeout-s", "1",
-        ]
-    )
+    exit_code = main._run_elevated_helper(argv)
 
     assert exit_code == 0
     assert calls == [("disable", "A"), ("enable", "A")]
@@ -227,23 +240,10 @@ def test_guarded_disable_auto_reverts_when_no_command_arrives(monkeypatch, tmp_p
         "run_elevated_worker_op",
         lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
     )
-    monotonic_values = iter((0.0, 0.0, 1.0))
-    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
-    result_file = str(tmp_path / "monitor_op_result_111_229.json")
-    command_file = tmp_path / "monitor_guard_command_111_229.json"
-    completion_file = tmp_path / "monitor_guard_result_111_229.json"
+    _force_single_poll_timeout(monkeypatch)
+    _command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "229")
 
-    exit_code = main._run_elevated_helper(
-        [
-            "--monitor-op", "guarded-disable",
-            "--instance-id", "A",
-            "--result-file", result_file,
-            "--guard-command-file", str(command_file),
-            "--guard-result-file", str(completion_file),
-            "--guard-timeout-s", "1",
-        ]
-    )
+    exit_code = main._run_elevated_helper(argv)
 
     assert exit_code == 0
     assert calls == [("disable", "A"), ("enable", "A")]
@@ -264,26 +264,80 @@ def test_guarded_disable_ignores_an_invalid_action_and_still_auto_reverts(monkey
         "run_elevated_worker_op",
         lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
     )
-    monotonic_values = iter((0.0, 0.0, 1.0))
-    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
-    result_file = str(tmp_path / "monitor_op_result_111_230.json")
-    command_file = tmp_path / "monitor_guard_command_111_230.json"
-    completion_file = tmp_path / "monitor_guard_result_111_230.json"
+    _force_single_poll_timeout(monkeypatch)
+    command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "230")
     command_file.write_text(json.dumps({"action": "nuke"}), encoding="utf-8")
 
-    exit_code = main._run_elevated_helper(
-        [
-            "--monitor-op", "guarded-disable",
-            "--instance-id", "A",
-            "--result-file", result_file,
-            "--guard-command-file", str(command_file),
-            "--guard-result-file", str(completion_file),
-            "--guard-timeout-s", "1",
-        ]
-    )
+    exit_code = main._run_elevated_helper(argv)
 
     assert exit_code == 0
+    assert calls == [("disable", "A"), ("enable", "A")]
+    completion = json.loads(completion_file.read_text(encoding="utf-8"))
+    assert completion["action"] == "auto_revert"
+    assert completion["reason"] == "invalid_action"
+
+
+def test_guarded_disable_unhashable_action_value_does_not_crash(monkeypatch, tmp_path):
+    # A well-formed JSON command whose "action" is a list/dict (not a
+    # string) must not crash `requested in {"keep", "revert"}` with an
+    # unhashable-type TypeError -- that would kill this still-elevated
+    # helper before it ever writes a result or re-enables the monitor,
+    # forcing bridge.py's separate guard to re-elevate with a second UAC
+    # prompt instead of the fail-safe auto-reverting cleanly.
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "run_elevated_worker_op",
+        lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
+    )
+    _force_single_poll_timeout(monkeypatch)
+    command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "234")
+    command_file.write_text(json.dumps({"action": ["revert"]}), encoding="utf-8")
+
+    exit_code = main._run_elevated_helper(argv)
+
+    assert exit_code == 0
+    assert calls == [("disable", "A"), ("enable", "A")]
+    completion = json.loads(completion_file.read_text(encoding="utf-8"))
+    assert completion["action"] == "auto_revert"
+    assert completion["reason"] == "invalid_action"
+
+
+def test_guarded_disable_reason_reflects_the_most_recent_poll(monkeypatch, tmp_path):
+    # last_reason is overwritten every iteration, not OR'd together across
+    # the whole window -- a transient bad read on an early poll must not
+    # permanently outrank whatever the loop actually observes on a later
+    # poll, right up until the deadline. The command file's content can't
+    # change mid-test here, so json.load itself is faked to be flaky: the
+    # first poll raises (malformed), the second poll succeeds and reads a
+    # well-formed-but-invalid action.
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "run_elevated_worker_op",
+        lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
+    )
+    monotonic_values = iter((0.0, 0.0, 0.5, 1.0))
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "235")
+    command_file.write_text(json.dumps({"action": "nuke"}), encoding="utf-8")
+
+    real_json_load = json.load
+    poll_count = {"n": 0}
+
+    def flaky_load(f):
+        poll_count["n"] += 1
+        if poll_count["n"] == 1:
+            raise json.JSONDecodeError("boom", "doc", 0)
+        return real_json_load(f)
+
+    monkeypatch.setattr(main.json, "load", flaky_load)
+
+    exit_code = main._run_elevated_helper(argv)
+
+    assert exit_code == 0
+    assert poll_count["n"] == 2
     assert calls == [("disable", "A"), ("enable", "A")]
     completion = json.loads(completion_file.read_text(encoding="utf-8"))
     assert completion["action"] == "auto_revert"
@@ -304,27 +358,18 @@ def test_guarded_disable_command_file_only_acts_on_the_launched_instance_id(monk
         return True, f"{op} {instance_id}"
 
     monkeypatch.setattr(main, "run_elevated_worker_op", worker)
-    result_file = str(tmp_path / "monitor_op_result_111_231.json")
-    command_file = tmp_path / "monitor_guard_command_111_231.json"
-    completion_file = tmp_path / "monitor_guard_result_111_231.json"
+    command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "231")
     command_file.write_text(
         json.dumps({"action": "revert", "instance_id": "B"}), encoding="utf-8"
     )
 
-    exit_code = main._run_elevated_helper(
-        [
-            "--monitor-op", "guarded-disable",
-            "--instance-id", "A",
-            "--result-file", result_file,
-            "--guard-command-file", str(command_file),
-            "--guard-result-file", str(completion_file),
-            "--guard-timeout-s", "1",
-        ]
-    )
+    exit_code = main._run_elevated_helper(argv)
 
     assert exit_code == 0
+    # calls == [("disable", "A"), ("enable", "A")] below already pins every
+    # element exactly, which is itself the proof that "B" was never acted
+    # on -- no separate `"B" not in calls` assertion needed on top of it.
     assert calls == [("disable", "A"), ("enable", "A")]
-    assert all(instance_id != "B" for _op, instance_id in calls)
     assert json.loads(completion_file.read_text(encoding="utf-8")) == {
         "action": "revert",
         "results": [{"instance_id": "A", "ok": True, "message": "enable A"}],
@@ -345,24 +390,11 @@ def test_guarded_disable_malformed_command_file_does_not_crash_and_auto_reverts(
         "run_elevated_worker_op",
         lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
     )
-    monotonic_values = iter((0.0, 0.0, 1.0))
-    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
-    result_file = str(tmp_path / "monitor_op_result_111_232.json")
-    command_file = tmp_path / "monitor_guard_command_111_232.json"
-    completion_file = tmp_path / "monitor_guard_result_111_232.json"
+    _force_single_poll_timeout(monkeypatch)
+    command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "232")
     command_file.write_text("{not valid json", encoding="utf-8")
 
-    exit_code = main._run_elevated_helper(
-        [
-            "--monitor-op", "guarded-disable",
-            "--instance-id", "A",
-            "--result-file", result_file,
-            "--guard-command-file", str(command_file),
-            "--guard-result-file", str(completion_file),
-            "--guard-timeout-s", "1",
-        ]
-    )
+    exit_code = main._run_elevated_helper(argv)
 
     assert exit_code == 0
     assert calls == [("disable", "A"), ("enable", "A")]
