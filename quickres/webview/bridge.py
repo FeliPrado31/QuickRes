@@ -89,6 +89,8 @@ def _ui_strings(lang: str | None = None) -> dict:
         "preset_kind_native", "preset_kind_stretched", "preset_kind_low",
         "boot_error_title", "boot_error_body", "btn_retry",
         "update_available_title", "update_available_body", "btn_update_now", "btn_later",
+        "btn_retry_download", "update_downloading", "update_downloading_unknown",
+        "update_verifying", "update_ready", "update_installing", "update_failed",
     ]
     return {key: i18n.t(key, lang=lang) for key in keys}
 
@@ -524,8 +526,16 @@ class Api:
         self._hotkey_lock = threading.Lock()
         self._hotkey_toggle = None
         self._hotkey_running = False
+        # The download/verification phase of an update runs independently
+        # from the UI thread.  Replacement still goes through this Api so
+        # the normal monitor and hotkey safety hand-off is preserved.
+        self._update_job = None
         self._pending_guard = None
         self._pending_guard_timer = None
+        # Present only during the same short confirmation window as
+        # _pending_guard.  It is a one-use channel to the already-elevated
+        # helper, never persisted or reused after the guard settles.
+        self._guarded_disable_session = None
         # How many auto-revert attempts (initial + retries) have
         # been armed for the CURRENT self._pending_guard -- see
         # _AUTO_REVERT_MAX_ATTEMPTS above and _maybe_retry_auto_revert
@@ -535,13 +545,12 @@ class Api:
 
     # -- Read-only / simple methods ------------------------------------------
 
-    @bridge_op()
-    def get_initial_state(self):
-        cfg = config.load_config()
-        theme = cfg.get("theme") if cfg.get("theme") in ("dark", "light") else detect_system_theme()
-        lang_setting = cfg.get("language", "auto")
-        resolved_lang = i18n.resolve_language(lang_setting)
-        i18n.set_language(resolved_lang)
+    def _resolution_state(self):
+        """Read the actual desktop mode and classify the quick presets.
+
+        Kept in one helper because the panel needs the exact same snapshot at
+        boot and during its lightweight external-display-change refresh.
+        """
         current = display.get_current_resolution()
         current_wh = current or (display.QUICK_LIST[0][1], display.QUICK_LIST[0][2])
         presets = [
@@ -553,6 +562,19 @@ class Api:
             for label, width, height in display.QUICK_LIST
         ]
         return {
+            "current_resolution": {"width": current[0], "height": current[1]} if current else None,
+            "presets": presets,
+        }
+
+    @bridge_op()
+    def get_initial_state(self):
+        cfg = config.load_config()
+        theme = cfg.get("theme") if cfg.get("theme") in ("dark", "light") else detect_system_theme()
+        lang_setting = cfg.get("language", "auto")
+        resolved_lang = i18n.resolve_language(lang_setting)
+        i18n.set_language(resolved_lang)
+        resolution_state = self._resolution_state()
+        return {
             "theme": theme,
             "version": __version__,
             "language": {
@@ -561,8 +583,7 @@ class Api:
                 "options": i18n.LANGUAGE_NAMES,
             },
             "strings": _ui_strings(resolved_lang),
-            "current_resolution": {"width": current[0], "height": current[1]} if current else None,
-            "presets": presets,
+            **resolution_state,
             "hotkey": {
                 "key": cfg.get("hotkey", "F6"),
                 "native_res": cfg.get("native_res", ""),
@@ -573,6 +594,11 @@ class Api:
             "pending": self.recover_on_boot(),
             "faq": _faq_bundle(resolved_lang),
         }
+
+    @bridge_op()
+    def get_resolution_state(self):
+        """Current OS resolution for the panel's low-cost refresh loop."""
+        return self._resolution_state()
 
     @bridge_op()
     def set_theme(self, theme):
@@ -760,14 +786,24 @@ class Api:
             if not guard.acquired:
                 raise RuntimeError("A hotkey start/stop is already in progress")
             toggle = self._hotkey_toggle
-            self._hotkey_toggle = None
-            self._hotkey_running = False
             if toggle is not None:
-                toggle.stop()
+                # A listener that did not acknowledge WM_QUIT is still live.
+                # Keep its object and running state so the user can retry
+                # Stop; discarding it would orphan the thread and permit a
+                # competing Start attempt.
+                if toggle.stop() is False:
+                    self._hotkey_running = toggle.is_running
+                    raise RuntimeError(
+                        "The hotkey listener is still stopping. Try again in a moment."
+                    )
+                self._hotkey_toggle = None
+                self._hotkey_running = False
                 if toggle.is_stretched:
                     ok, message = display.set_resolution(*toggle.native_res)
                     if not ok:
                         raise RuntimeError(message)
+            else:
+                self._hotkey_running = False
 
     @bridge_op()
     def stop_hotkey(self):
@@ -816,8 +852,14 @@ class Api:
         info = updater.fetch_version_info()
         return {**info, "update_available": updater.update_available(__version__, info)}
 
-    @bridge_op(lock=True)
-    def confirm_update(self, download_url, version_info=None):
+    def _prepare_update_handoff_locked(self):
+        """Best-effort safety hand-off before an update exits this process.
+
+        The caller must hold ``self._op_lock``.  This is shared by the
+        legacy one-shot updater and the new download-then-install flow, so
+        both paths resolve a pending monitor guard and stop an active
+        stretched hotkey before the updater launches its replacement batch.
+        """
         # Forwarded through so updater.apply_update's optional sha256
         # hash-verification gate can actually engage once the
         # server-side version.json response starts supplying that field --
@@ -930,7 +972,50 @@ class Api:
             hotkey_reverter.start()
             hotkey_reverter.join(_HOTKEY_REVERT_UPDATE_TIMEOUT_S)
 
+    @bridge_op(lock=True)
+    def confirm_update(self, download_url, version_info=None):
+        """Backward-compatible one-shot update entry point."""
+        self._prepare_update_handoff_locked()
         return updater.confirm_update(download_url, version_info=version_info)
+
+    @bridge_op(lock=True)
+    def start_update(self, download_url, version_info=None):
+        """Start a background download and return its current progress."""
+        job = self._update_job
+        if job is not None:
+            state = job.snapshot()
+            if state.get("stage") in {"downloading", "verifying", "ready", "installing"}:
+                return state
+        job = updater.UpdateJob(download_url, version_info=version_info)
+        self._update_job = job
+        job.start()
+        return job.snapshot()
+
+    @bridge_op()
+    def get_update_status(self):
+        """Return the latest non-blocking update progress snapshot."""
+        job = self._update_job
+        if job is None:
+            return {
+                "stage": "idle",
+                "downloaded_bytes": 0,
+                "total_bytes": None,
+                "error": None,
+            }
+        return job.snapshot()
+
+    @bridge_op(lock=True)
+    def install_downloaded_update(self):
+        """Run the rollback-capable replacement after verification finished."""
+        job = self._update_job
+        if job is None or job.snapshot().get("stage") != "ready":
+            raise RuntimeError("No verified update is ready to install")
+        self._prepare_update_handoff_locked()
+        return updater.apply_update(
+            None,
+            version_info=job.version_info,
+            reuse_download=True,
+        )
 
     @bridge_op()
     def list_monitors(self):
@@ -990,6 +1075,7 @@ class Api:
 
         result_path = os.path.join(config.APP_DIR, monitors.make_result_filename())
         record = self._build_and_save_pending_record(instance_ids, result_path)
+        self._guarded_disable_session = None
         results = self._delegate_disable_to_helper(instance_ids, result_path, record)
         self._finalize_disable_outcome(results)
 
@@ -1153,6 +1239,15 @@ class Api:
         overlap = set(instance_ids) & guard_ids
         if not overlap:
             return
+        # The elevated helper was launched for the original whole batch. If
+        # the user manually re-enabled even one member, let that helper exit
+        # instead of allowing its fixed target list to re-enable it again at
+        # timeout. Any remaining guard targets still retain the ordinary
+        # retry/UAC fallback below.
+        if self._guard_session_covers(guard):
+            if not monitors.keep_guarded_disable(self._guarded_disable_session):
+                log_msg("guarded monitor helper did not acknowledge manual-enable handoff")
+            self._guarded_disable_session = None
         if guard_ids <= set(instance_ids):
             guard.confirm()
             self._pending_guard = None
@@ -1363,11 +1458,14 @@ class Api:
         })
 
     def _delegate_disable_to_helper(self, instance_ids, result_path, record):
-        """Hand the actual disable off to the elevated helper process."""
-        return monitors.set_monitors_enabled(
-            list(instance_ids), False, result_path=result_path,
-            on_helper_launched=lambda pid: self._save_helper_pid(record, pid, instance_ids),
-        )
+        """Disable via one bounded elevated helper, then retain its session."""
+        with monitors.guarded_disable_session(timeout_s=10.0) as guard_context:
+            results = monitors.set_monitors_enabled(
+                list(instance_ids), False, result_path=result_path,
+                on_helper_launched=lambda pid: self._save_helper_pid(record, pid, instance_ids),
+            )
+        self._guarded_disable_session = guard_context.session
+        return results
 
     def _finalize_disable_outcome(self, results):
         """Arm the auto-revert guard+timer for a confirmed disable, trim any
@@ -1431,10 +1529,31 @@ class Api:
         detail = "; ".join(f"{iid}: {msg}" for iid, msg in failures)
         log_msg(f"set_monitors_enabled({action}): {len(failures)} target(s) failed: {detail}")
 
+    def _guard_session_covers(self, guard, session=None):
+        session = self._guarded_disable_session if session is None else session
+        return bool(
+            session is not None
+            and set(guard.target_ids).issubset(session.instance_ids)
+        )
+
+    def _revert_guarded_session_or_elevate(self, guard, instance_ids):
+        """Use the one active helper first; fall back safely if it vanished."""
+        session = self._guarded_disable_session
+        if self._guard_session_covers(guard, session):
+            results = monitors.revert_guarded_disable(session)
+            # Each helper accepts exactly one terminal command.  A missing
+            # completion is treated as unavailable rather than guessed;
+            # the normal elevation path remains the safety fallback.
+            self._guarded_disable_session = None
+            if results is not None:
+                return results
+            log_msg("guarded monitor helper did not return a revert result; falling back to elevation")
+        return monitors.set_monitors_enabled(instance_ids, True)
+
     def _arm_auto_revert_guard(self, confirmed_ids):
         guard = PendingDisableGuard(
             armed_at=time.time(), target_ids=confirmed_ids,
-            revert_fn=lambda ids: monitors.set_monitors_enabled(ids, True),
+            revert_fn=lambda ids: self._revert_guarded_session_or_elevate(guard, ids),
         )
         self._pending_guard = guard
         self._pending_guard_attempt = 1
@@ -1621,6 +1740,12 @@ class Api:
         if guard is None:
             outcomes = self._check_no_in_flight_pending()
         if guard is not None:
+            if self._guard_session_covers(guard):
+                if not monitors.keep_guarded_disable(self._guarded_disable_session):
+                    raise RuntimeError(
+                        "The temporary elevated helper did not confirm the keep action"
+                    )
+                self._guarded_disable_session = None
             guard.confirm()
             self._pending_guard = None
         if self._pending_guard_timer is not None:
@@ -1709,7 +1834,11 @@ class Api:
         if self._pending_guard_timer is not None:
             self._pending_guard_timer.cancel()
             self._pending_guard_timer = None
-        results = monitors.set_monitors_enabled(target_ids, True) if target_ids else []
+        results = (
+            self._revert_guarded_session_or_elevate(guard, target_ids)
+            if guard is not None and target_ids
+            else (monitors.set_monitors_enabled(target_ids, True) if target_ids else [])
+        )
         # This used to trim/clear the record unconditionally on the
         # strength of "set_monitors_enabled didn't raise" -- but its return
         # value can (and does, for expected failure modes) report ok=False
@@ -1721,6 +1850,7 @@ class Api:
             if set(guard.target_ids) <= set(succeeded_ids):
                 guard.confirm()
                 self._pending_guard = None
+                self._guarded_disable_session = None
                 self._clear_or_trim_pending_record(guard, succeeded_ids=succeeded_ids)
             else:
                 # At least one of this guard's targets did not genuinely

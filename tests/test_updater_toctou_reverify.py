@@ -112,15 +112,17 @@ class TestReverificationBeforeMove:
         move_idx = next(
             i for i, line in enumerate(lines) if line.lower().startswith("move /y")
         )
-        powershell_indices = [
-            i for i, line in enumerate(lines) if line.lower().startswith("powershell")
+        reverify_indices = [
+            i
+            for i, line in enumerate(lines)
+            if line.lower().startswith("powershell") and "readallbytes" in line.lower()
         ]
-        assert powershell_indices, "expected a powershell re-verification step"
-        assert all(idx < move_idx for idx in powershell_indices)
+        assert reverify_indices, "expected a PowerShell PE re-verification step"
+        assert all(idx < move_idx for idx in reverify_indices)
 
         # The move must be gated on the re-verification step's outcome, not
         # run unconditionally right after it.
-        ps_idx = powershell_indices[0]
+        ps_idx = reverify_indices[0]
         following = lines[ps_idx + 1]
         assert "errorlevel" in following.lower()
 

@@ -82,6 +82,23 @@ class TestGetInitialState:
             assert key in data, f"missing key: {key}"
         assert len(data["faq"]) == 4
 
+
+class TestGetResolutionState:
+    def test_reads_the_os_mode_and_reclassifies_presets(self, monkeypatch):
+        monkeypatch.setattr(
+            "quickres.webview.bridge.display.get_current_resolution", lambda: (1280, 960)
+        )
+        api = Api()
+
+        result = api.get_resolution_state()
+
+        assert result["ok"] is True
+        data = result["data"]
+        assert data["current_resolution"] == {"width": 1280, "height": 960}
+        assert [p for p in data["presets"] if p["kind"] == "native"] == [
+            p for p in data["presets"] if (p["width"], p["height"]) == (1280, 960)
+        ]
+
     def test_has_no_customs_key(self, monkeypatch):
         # RES-2/D6: the 6-slot custom-resolution list is retired -- nothing
         # reads `custom_resolutions` from config anymore, so the response

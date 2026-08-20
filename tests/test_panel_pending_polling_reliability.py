@@ -295,3 +295,53 @@ def test_close_overlay_only_stops_polling_for_monitors_modal(panel_script):
     assert result["pollingActiveAfterMonitorsClose"] is False, (
         "closing the Monitors modal itself no longer stops its own modal-scoped guard polling"
     )
+
+
+# -- Finding 3: auto-revert must refresh monitor enabled-state in the UI --
+
+_AUTO_REVERT_REFRESH_SCENARIO = """
+(async () => {
+  S.pending = {
+    outcomes: [
+      { resolution: 'in_flight', instance_id: 'A', friendly_name: 'Monitor A', message: 'pending', elapsed_s: 5, can_force_unlock: false },
+    ],
+    force_unlockable: false,
+  };
+  S.monitors = [{ instance_id: 'A', friendly_name: 'Monitor A', enabled: false }];
+  S.guardRemainingS = 0;
+
+  window.pywebview = {
+    api: {
+      recheck_pending: async () => ({
+        ok: true,
+        data: { outcomes: [], force_unlockable: false, guard_remaining_s: null },
+      }),
+      list_monitors: async () => ({
+        ok: true,
+        data: [{ instance_id: 'A', friendly_name: 'Monitor A', enabled: true }],
+      }),
+    },
+  };
+
+  await pollGuardOnce();
+  console.log(JSON.stringify({
+    monitorEnabled: S.monitors[0].enabled,
+    pendingCount: S.pending.outcomes.length,
+    pollingStopped: guardPollTimer === null,
+  }));
+  process.exit(0);
+})().catch(function (err) {
+  fail((err && err.stack) || String(err));
+});
+"""
+
+
+def test_auto_revert_refreshes_monitor_enabled_state(panel_script):
+    result = _run_harness(panel_script, _AUTO_REVERT_REFRESH_SCENARIO)
+
+    assert result["monitorEnabled"] is True, (
+        "the monitor was re-enabled by the auto-revert but the panel kept "
+        "the stale disabled entry"
+    )
+    assert result["pendingCount"] == 0
+    assert result["pollingStopped"] is True

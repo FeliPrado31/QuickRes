@@ -57,14 +57,12 @@ def run_app(*, create_window_fn=None, start_fn=None):
         resource_path("quickres/webview/panel.html"),
         js_api=api,
         # Requested size is the OUTER window rect, not the WebView2 client
-        # area -- the native title bar + borders eat into it (measured ~13px
-        # width / ~36px height on a stock Windows 11 theme). Request larger
-        # than the panel.html's intended 410x530 content size so the client
-        # area comes out to at least that; panel.html itself fills whatever
-        # client area it actually gets (100% width/height), so this margin
-        # only needs to be generous, not exact.
-        width=428,
-        height=572,
+        # area -- the native title bar + borders eat into it. The original
+        # compact size made readable type and the monitor/update dialogs
+        # compete for the same vertical space, so leave a comfortable client
+        # area for the main controls and status text.
+        width=520,
+        height=700,
         resizable=False,
     )
     _WINDOW = window

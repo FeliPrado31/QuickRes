@@ -131,7 +131,7 @@ def test_stop_reports_status_when_post_thread_message_fails(monkeypatch):
     toggle._thread_id = 999999
     toggle._thread = None
 
-    toggle.stop()
+    assert toggle.stop() is True
 
     assert statuses, "expected a status message reporting the failed signal"
     assert "stop" in statuses[-1].lower() or "signal" in statuses[-1].lower()
@@ -156,11 +156,40 @@ def test_stop_reports_status_when_thread_does_not_exit_within_join_timeout(monke
     toggle._thread.start()
 
     try:
-        toggle.stop()
+        assert toggle.stop() is False
         assert statuses, "expected a status message reporting the orphaned thread"
         assert "stop" in statuses[-1].lower() or "alive" in statuses[-1].lower()
+        assert toggle._thread_id == 999999, "a live listener must remain addressable for retry"
     finally:
         block.set()
+        toggle._thread.join(timeout=1)
+
+
+def test_stop_keeps_thread_id_when_post_fails_but_listener_is_still_alive(monkeypatch):
+    """A failed WM_QUIT post is not proof that a live listener disappeared.
+
+    Keep its id so a later Stop can retry rather than orphaning the thread
+    and letting bridge.py start a competing listener.
+    """
+    monkeypatch.setattr(hotkey_mod, "_STOP_JOIN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(hotkey_mod.user32, "PostThreadMessageW", lambda *a, **kw: 0)
+    toggle = HotkeyToggle(
+        "F9", native_res=(1920, 1080), stretched_res=(1280, 1024),
+        on_status=lambda m: None,
+    )
+    toggle._thread_id = 4242
+    toggle._registered = True
+    release = threading.Event()
+    toggle._thread = threading.Thread(target=lambda: release.wait(timeout=2), daemon=True)
+    toggle._thread.start()
+
+    try:
+        assert toggle.stop() is False
+        assert toggle._thread_id == 4242
+        assert toggle._registered is True
+        assert toggle.is_running is True
+    finally:
+        release.set()
         toggle._thread.join(timeout=1)
 
 

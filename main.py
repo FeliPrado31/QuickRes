@@ -1,5 +1,8 @@
 import ctypes
+import json
+import os
 import sys
+import time
 import traceback
 
 from quickres.monitors import run_elevated_worker_op
@@ -17,9 +20,14 @@ def _run_elevated_helper(argv) -> int:
     from quickres.config import APP_DIR, log_msg, write_json_atomic
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--monitor-op", required=True, choices=["enable", "disable"])
+    parser.add_argument(
+        "--monitor-op", required=True, choices=["enable", "disable", "guarded-disable"]
+    )
     parser.add_argument("--instance-id", required=True, action="append")
     parser.add_argument("--result-file", required=True)
+    parser.add_argument("--guard-command-file")
+    parser.add_argument("--guard-result-file")
+    parser.add_argument("--guard-timeout-s", type=float)
     args = parser.parse_args(argv)
 
     # This elevated (admin-privileged) process must validate its own
@@ -43,17 +51,74 @@ def _run_elevated_helper(argv) -> int:
             print(message, file=sys.stderr)
         return 1
 
+    guarded = args.monitor_op == "guarded-disable"
+    if guarded:
+        if not (
+            args.guard_command_file
+            and args.guard_result_file
+            and args.guard_timeout_s is not None
+            and 1.0 <= args.guard_timeout_s <= 60.0
+            and recovery.is_safe_guard_command_path(args.guard_command_file, APP_DIR)
+            and recovery.is_safe_guard_result_path(args.guard_result_file, APP_DIR)
+        ):
+            message = "Refusing invalid guarded monitor-helper arguments"
+            log_msg(message)
+            if sys.stderr is not None:
+                print(message, file=sys.stderr)
+            return 1
+
     results = []
     for instance_id in args.instance_id:
         try:
-            ok, message = run_elevated_worker_op(args.monitor_op, instance_id)
+            ok, message = run_elevated_worker_op(
+                "disable" if guarded else args.monitor_op, instance_id
+            )
         except Exception as e:
             ok, message = False, f"Elevated helper crashed: {e}"
         results.append({"instance_id": instance_id, "ok": bool(ok), "message": message})
 
     if not write_json_atomic(args.result_file, {"results": results}):
         return 1
-    return 0 if all(r["ok"] for r in results) else 1
+    if not guarded:
+        return 0 if all(r["ok"] for r in results) else 1
+
+    # The helper remains elevated only for this bounded confirmation window.
+    # Its unprivileged command file cannot introduce a new operation: it can
+    # only keep the already-applied disable or re-enable these exact ids.
+    deadline = time.monotonic() + args.guard_timeout_s
+    action = None
+    while time.monotonic() < deadline:
+        try:
+            if os.path.exists(args.guard_command_file):
+                with open(args.guard_command_file, "r", encoding="utf-8") as f:
+                    command = json.load(f)
+                requested = command.get("action") if isinstance(command, dict) else None
+                if requested in {"keep", "revert"}:
+                    action = requested
+                    break
+        except (OSError, ValueError, json.JSONDecodeError):
+            # A partially-written/malformed command is ignored; timeout
+            # remains the fail-safe and will auto-revert.
+            pass
+        time.sleep(0.05)
+
+    action = action or "auto_revert"
+    completion = {"action": action, "results": []}
+    if action != "keep":
+        for instance_id in args.instance_id:
+            try:
+                ok, message = run_elevated_worker_op("enable", instance_id)
+            except Exception as e:
+                ok, message = False, f"Elevated helper crashed: {e}"
+            completion["results"].append(
+                {"instance_id": instance_id, "ok": bool(ok), "message": message}
+            )
+
+    if not write_json_atomic(args.guard_result_file, completion):
+        return 1
+    if action == "keep":
+        return 0
+    return 0 if all(r["ok"] for r in completion["results"]) else 1
 
 
 def _show_startup_failure(message: str):

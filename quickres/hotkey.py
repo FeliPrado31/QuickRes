@@ -174,7 +174,7 @@ class HotkeyToggle:
                 "be in use by another application"
             )
 
-    def stop(self):
+    def stop(self) -> bool:
         """Signal the listener thread to quit and wait for it to actually
         exit. `PostThreadMessageW`'s return value must be checked (it can
         fail, e.g. if the target thread already exited or the thread id is
@@ -185,6 +185,7 @@ class HotkeyToggle:
         `on_status`/`log_msg` pattern `_run` uses for its own status
         reporting, rather than being silently reported as a clean stop.
         """
+        thread = self._thread
         if self._thread_id:
             if not user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0):
                 msg = f"Could not signal hotkey listener thread to stop ({self.key_name})"
@@ -193,16 +194,27 @@ class HotkeyToggle:
                     f"PostThreadMessageW failed for hotkey {self.key_name} "
                     f"listener thread {self._thread_id}"
                 )
-        if self._thread:
-            self._thread.join(timeout=_STOP_JOIN_TIMEOUT_S)
-            if self._thread.is_alive():
+        if thread:
+            thread.join(timeout=_STOP_JOIN_TIMEOUT_S)
+            if thread.is_alive():
                 msg = f"Hotkey listener thread did not stop cleanly ({self.key_name})"
                 self.on_status(msg)
                 log_msg(
                     f"Hotkey {self.key_name} listener thread still alive after "
                     f"{_STOP_JOIN_TIMEOUT_S}s join timeout"
                 )
+                # Keep the live listener's id.  Clearing it here would make
+                # `is_running` lie and would prevent a later Stop attempt
+                # from posting WM_QUIT to the still-running thread.
+                return False
+
+        # A failed PostThreadMessageW can mean either a stale id or a race
+        # with a listener that already exited.  Once the thread is known to
+        # be gone (or there was never a thread object), it is safe to clear
+        # the stale state; until then, preserve it for a retry.
         self._thread_id = None
+        self._registered = False
+        return True
 
     def _toggle(self):
         # Held for the whole read + slow
@@ -300,4 +312,5 @@ class HotkeyToggle:
                 self._handle_hotkey_message()
 
         user32.UnregisterHotKey(None, HOTKEY_ID)
+        self._registered = False
         self._thread_id = None

@@ -86,3 +86,24 @@ class TestStopHotkeySurfacesRevertFailure:
 
         assert result["ok"] is False
         assert "driver refused resolution" in result["message"]
+
+
+def test_stop_keeps_live_toggle_when_listener_did_not_exit():
+    class FakeToggle:
+        is_stretched = False
+        is_running = True
+
+        def stop(self):
+            return False
+
+    api = Api()
+    toggle = FakeToggle()
+    api._hotkey_toggle = toggle
+    api._hotkey_running = True
+
+    result = api.stop_hotkey()
+
+    assert result["ok"] is False
+    assert "still stopping" in result["message"].lower()
+    assert api._hotkey_toggle is toggle
+    assert api._hotkey_running is True

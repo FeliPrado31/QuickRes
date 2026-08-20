@@ -165,3 +165,86 @@ def test_no_batch_flag_code_path_exists():
     with open("main.py", "r", encoding="utf-8") as f:
         content = f.read()
     assert "--batch" not in content
+
+
+def test_guarded_disable_reuses_the_same_elevated_helper_for_revert(monkeypatch, tmp_path):
+    calls = []
+
+    def worker(op, instance_id):
+        calls.append((op, instance_id))
+        return True, f"{op} {instance_id}"
+
+    monkeypatch.setattr(main, "run_elevated_worker_op", worker)
+    result_file = str(tmp_path / "monitor_op_result_111_227.json")
+    command_file = tmp_path / "monitor_guard_command_111_227.json"
+    completion_file = tmp_path / "monitor_guard_result_111_227.json"
+    command_file.write_text(json.dumps({"action": "revert"}), encoding="utf-8")
+
+    exit_code = main._run_elevated_helper(
+        [
+            "--monitor-op", "guarded-disable",
+            "--instance-id", "A",
+            "--result-file", result_file,
+            "--guard-command-file", str(command_file),
+            "--guard-result-file", str(completion_file),
+            "--guard-timeout-s", "1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("disable", "A"), ("enable", "A")]
+    assert json.loads(completion_file.read_text(encoding="utf-8")) == {
+        "action": "revert",
+        "results": [{"instance_id": "A", "ok": True, "message": "enable A"}],
+    }
+
+
+def test_guarded_disable_refuses_an_unsafe_command_path_before_any_operation(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(main, "run_elevated_worker_op", lambda *args: calls.append(args))
+    result_file = str(tmp_path / "monitor_op_result_111_228.json")
+    completion_file = tmp_path / "monitor_guard_result_111_228.json"
+
+    exit_code = main._run_elevated_helper(
+        [
+            "--monitor-op", "guarded-disable",
+            "--instance-id", "A",
+            "--result-file", result_file,
+            "--guard-command-file", str(tmp_path.parent / "monitor_guard_command_111_228.json"),
+            "--guard-result-file", str(completion_file),
+            "--guard-timeout-s", "1",
+        ]
+    )
+
+    assert exit_code == 1
+    assert calls == []
+
+
+def test_guarded_disable_auto_reverts_when_no_command_arrives(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "run_elevated_worker_op",
+        lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
+    )
+    monotonic_values = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    result_file = str(tmp_path / "monitor_op_result_111_229.json")
+    command_file = tmp_path / "monitor_guard_command_111_229.json"
+    completion_file = tmp_path / "monitor_guard_result_111_229.json"
+
+    exit_code = main._run_elevated_helper(
+        [
+            "--monitor-op", "guarded-disable",
+            "--instance-id", "A",
+            "--result-file", result_file,
+            "--guard-command-file", str(command_file),
+            "--guard-result-file", str(completion_file),
+            "--guard-timeout-s", "1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("disable", "A"), ("enable", "A")]
+    assert json.loads(completion_file.read_text(encoding="utf-8"))["action"] == "auto_revert"
