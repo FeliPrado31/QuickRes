@@ -3,6 +3,7 @@
   <img src="QuickRes.png" width="140" alt="QuickRes">
 </p>
 if youve been false banned read https://sites.google.com/view/quickresonline/home
+
 A tiny Windows tool for instantly switching your resolution with one click.
 
 Built with stretched resolutions for Valorant in mind, but it works for switching resolution on anything.
