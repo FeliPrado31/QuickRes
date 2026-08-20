@@ -51,7 +51,7 @@ FORBIDDEN_TOKENS = ["--ac", "--acbg", "--wn", "--wnbg", "--ok", "--okbg", "--er"
 
 FONT_TOKEN_NAMES = {"--font-display", "--font-body", "--font-mono", "--font-glyph"}
 
-CIRCULAR_SELECTORS = {".qr-monitor-notice-dot", ".qr-dialog-dot"}
+CIRCULAR_SELECTORS = {".qr-monitor-notice-dot", ".qr-dialog-dot", ".qr-update-progress"}
 
 EXPECTED_FACES = {
     ("Chakra Petch", "600"),
@@ -174,16 +174,16 @@ def test_04_no_accent_or_shadow_hue_tokens_survive(panel_html):
 
 
 # =============================================================================
-# 5. Zero-radius convention: one global `*{border-radius:0}` reset; exactly
-#    the 3 genuinely circular/pill selectors override to 999px; nothing else
+# 5. Compact-radius convention: one global `*{border-radius:8px}` reset;
+#    exactly the circular/pill selectors override to 999px; nothing else
 # =============================================================================
 
 
-def test_05_border_radius_zero_except_three_circular_selectors(panel_html):
+def test_05_border_radius_scale_is_compact_except_circular_selectors(panel_html):
     css = _style_block(panel_html)
     assert re.search(
-        r"\*\s*,\s*\*::before\s*,\s*\*::after\s*\{[^}]*border-radius\s*:\s*0\b", css
-    ), "expected a global *,*::before,*::after{border-radius:0} reset"
+        r"\*\s*,\s*\*::before\s*,\s*\*::after\s*\{[^}]*border-radius\s*:\s*8px\b", css
+    ), "expected a global *,*::before,*::after{border-radius:8px} reset"
 
     pill_selectors = set(re.findall(r"([.\#][\w-]+)\s*\{[^}]*border-radius\s*:\s*999px", css))
     assert pill_selectors == CIRCULAR_SELECTORS, (
@@ -191,8 +191,8 @@ def test_05_border_radius_zero_except_three_circular_selectors(panel_html):
     )
 
     other_radii = re.findall(r"border-radius\s*:\s*(\d+)px", css)
-    stray = [v for v in other_radii if v not in ("0", "999")]
-    assert not stray, f"unexpected non-zero, non-pill border-radius value(s): {stray}"
+    stray = [v for v in other_radii if v not in ("8", "999")]
+    assert not stray, f"unexpected non-standard border-radius value(s): {stray}"
 
 
 # =============================================================================
@@ -485,16 +485,16 @@ def test_20_no_remote_network_references_in_src_or_href(panel_html):
 # =============================================================================
 
 
-def test_21_hotkey_native_stretched_inputs_not_statically_required(panel_html):
-    for input_id in ("qr-hotkey-native", "qr-hotkey-stretched"):
-        tag_match = re.search(r'<input\b[^>]*id="' + input_id + r'"[^>]*>', panel_html)
-        assert tag_match, f"expected an <input id=\"{input_id}\"> in panel.html"
-        tag = tag_match.group(0)
-        assert "required" not in tag, (
-            f"#{input_id} must not be statically `required` -- boot() applies a "
-            f"script-side default so first-run Start Hotkey never fails validation "
-            f"on an empty static value"
+def test_21_hotkey_native_stretched_selects_preserve_saved_values(panel_html):
+    for select_id in ("qr-hotkey-native", "qr-hotkey-stretched"):
+        tag_match = re.search(r'<select\b[^>]*id="' + select_id + r'"[^>]*>', panel_html)
+        assert tag_match, f"expected a <select id=\"{select_id}\"> in panel.html"
+        assert "required" not in tag_match.group(0), (
+            f"#{select_id} must not be statically required -- boot() applies defaults"
         )
+    js = _script_block(panel_html)
+    assert "[state.hotkey.native_res, state.hotkey.stretched_res]" in js
+    assert "Keep that" in js and "configuration" in js
 
 
 # =============================================================================
@@ -588,12 +588,12 @@ def test_25_modal_head_builder_extracted_single_qr_modal_close_literal(panel_htm
 
 def test_26_preset_kind_labels_use_i18n_strings(panel_html):
     js = _script_block(panel_html)
-    res_section = re.search(r"function renderResSection[\s\S]*?\n}\n", js)
-    assert res_section, "expected renderResSection function"
+    res_section = re.search(r"function renderPresetCards[\s\S]*?\n}\n", js)
+    assert res_section, "expected renderPresetCards function"
     body = res_section.group(0)
     for key in ("preset_kind_native", "preset_kind_stretched", "preset_kind_low"):
         assert re.search(r"\bs\." + key + r"\b", body), (
-            f"expected renderResSection to read {key} from state.strings, matching "
+            f"expected renderPresetCards to read {key} from state.strings, matching "
             f"how every other visible chrome label goes through s.strings"
         )
 
@@ -836,28 +836,15 @@ def test_37_check_updates_click_opens_modal_only_when_available(panel_html):
     )
 
 
-def test_38_update_now_forwards_full_check_updates_response(panel_html):
+def test_38_update_now_starts_background_download_with_full_update_info(panel_html):
     js = _script_block(panel_html)
-    branch = re.search(
-        r"if \(e\.target\.id === 'qr-update-now'\) \{([\s\S]*?)\n  \}\n", js
-    )
-    assert branch, "expected a qr-update-now click branch in the overlays handler"
-    body = branch.group(1)
-    call_match = re.search(r"call\('confirm_update',\s*([^,]+),\s*([^)]+)\)", body)
-    assert call_match, f"expected confirm_update called with (download_url, version_info): {body}"
-    download_arg, info_arg = call_match.group(1).strip(), call_match.group(2).strip()
-    assert "download_url" in download_arg, (
-        f"first confirm_update argument must read .download_url off the stored "
-        f"check_updates() response, got {download_arg!r}"
-    )
-    assert info_arg not in ("null", "undefined", "true", "false", download_arg), (
-        f"second confirm_update argument must be the FULL stored check_updates() "
-        f"response object itself (not a narrowed field), got {info_arg!r}"
-    )
-    assert "download_url" not in info_arg, (
-        f"second confirm_update argument must be the whole stored response, not "
-        f"a narrowed .download_url field, got {info_arg!r}"
-    )
+    assert "e.target.id === 'qr-update-now' || e.target.id === 'qr-update-retry'" in js
+    assert "await startUpdateDownload();" in js
+    start_fn = re.search(r"async function startUpdateDownload\(\) \{([\s\S]*?)\n\}", js)
+    assert start_fn, "expected startUpdateDownload() helper"
+    body = start_fn.group(1)
+    assert "call('start_update', S.updateInfo.download_url, S.updateInfo)" in body
+    assert "startUpdatePolling();" in body
 
 
 def test_39_update_later_closes_overlay(panel_html):
@@ -872,10 +859,14 @@ def test_40_update_modal_strings_use_i18n_not_hardcoded_english(panel_html):
     fn_match = re.search(r"function\s+updateModalMarkup\s*\([\s\S]*?\n\}\n", js)
     assert fn_match, "expected an updateModalMarkup() function"
     body = fn_match.group(0)
-    for key in ("update_available_title", "update_available_body", "btn_update_now", "btn_later"):
+    for key in ("update_available_title", "btn_update_now", "btn_later", "btn_retry_download"):
         assert re.search(r"\bs\." + key + r"\b", body) or re.search(r"\bS\.strings\." + key + r"\b", body), (
             f"expected updateModalMarkup() to read {key} from state.strings"
         )
+    status_fn = re.search(r"function\s+updateStatusText\s*\([^)]*\)\s*\{[\s\S]*?\n\}", js)
+    assert status_fn, "expected a translated updateStatusText() helper"
+    for key in ("update_available_body", "update_downloading", "update_verifying", "update_ready", "update_installing", "update_failed"):
+        assert key in status_fn.group(0), f"expected {key} in translated update status copy"
 
 
 # =============================================================================
@@ -948,7 +939,7 @@ def test_43_recovery_card_gated_on_pending_outcomes_not_live_guard(panel_html):
 
     # The countdown pill itself must degrade gracefully (hidden/empty)
     # instead of rendering "nulls" when there is no live guard.
-    assert "S.guardRemainingS == null" in body and "countdown.hidden" in body, (
+    assert "displayRemainingS == null" in body and "countdown.hidden" in body, (
         "expected the countdown pill to hide itself when there is no live "
         "guard, rather than assuming S.guardRemainingS is always a number"
     )
@@ -972,6 +963,40 @@ def test_42_both_pick_resolution_call_sites_use_shared_result_handler(panel_html
         "check must be fully replaced by the shared helper, not left duplicated "
         "alongside it"
     )
+
+
+# =============================================================================
+# 42b. The active preset is OS state, not the last clicked card. A game or
+# Windows Settings may change resolution without ever sending a panel click.
+# =============================================================================
+
+
+def test_42b_active_resolution_border_matches_the_current_os_snapshot(panel_html):
+    js = _script_block(panel_html)
+    section = re.search(r"function renderPresetCards[\s\S]*?\n}\n", js)
+    assert section, "expected renderPresetCards helper"
+    body = section.group(0)
+    assert "const isCurrent" in body
+    assert "state.currentResolution" in body
+    assert "p.width === state.currentResolution.width" in body
+    assert "p.height === state.currentResolution.height" in body
+    assert "isCurrent ? 'qr-res-preset-native' : ''" in body, (
+        "the active outline must follow an exact OS-resolution match, not p.kind from an old render"
+    )
+
+
+def test_42b_resolution_poll_is_quiet_and_redraws_only_preset_cards(panel_html):
+    js = _script_block(panel_html)
+    refresh = re.search(r"async function refreshResolutionState[\s\S]*?\n}\n", js)
+    assert refresh, "expected passive resolution refresh helper"
+    body = refresh.group(0)
+    assert "call('get_resolution_state', CALL_QUIET)" in body
+    assert "renderPresetCards(S);" in body
+    assert "renderResSection(S);" not in body, (
+        "background resolution checks must not reset hotkey selects or cause a broader redraw"
+    )
+    assert "RESOLUTION_POLL_MS = 2000" in js
+    assert "setInterval(refreshResolutionState, RESOLUTION_POLL_MS)" in js
 
 
 # =============================================================================
@@ -1097,6 +1122,34 @@ def test_46_guard_countdown_switches_to_polling_recheck_pending_on_expiry(panel_
         "stopCountdown() cleanup, so the interval doesn't leak past modal "
         "close"
     )
+
+
+def test_46b_guard_countdown_renders_only_clamped_whole_seconds(panel_html):
+    js = _script_block(panel_html)
+
+    format_match = re.search(
+        r"function\s+displayGuardRemainingS\s*\([^)]*\)\s*\{[\s\S]*?\n\}",
+        js,
+    )
+    assert format_match, "expected displayGuardRemainingS() countdown formatter"
+    format_body = format_match.group(0)
+    assert "Number.isFinite(seconds)" in format_body
+    assert "Math.max(0, Math.ceil(seconds))" in format_body, (
+        "the countdown must round fractional bridge values up and clamp at "
+        "zero, so it cannot render decimal or negative seconds"
+    )
+
+    countdown_match = re.search(r"function startCountdownIfNeeded\(\) \{[\s\S]*?\n\}\n", js)
+    assert countdown_match
+    countdown_body = countdown_match.group(0)
+    assert "S.guardRemainingS = displayGuardRemainingS(S.guardRemainingS);" in countdown_body
+    assert "S.guardRemainingS = Math.max(0, S.guardRemainingS - 1);" in countdown_body
+
+    render_match = re.search(r"function renderMonitorsModal\(\) \{[\s\S]*?\n\}\n", js)
+    assert render_match
+    render_body = render_match.group(0)
+    assert "const displayRemainingS = displayGuardRemainingS(S.guardRemainingS);" in render_body
+    assert "countdown.textContent = displayRemainingS != null ? displayRemainingS + 's' : '';" in render_body
 
 
 # =============================================================================

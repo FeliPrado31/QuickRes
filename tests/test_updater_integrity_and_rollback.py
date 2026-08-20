@@ -6,8 +6,8 @@
    be rejected and cleaned up, not written to disk and executed.
 2. The generated update.bat script must NOT unconditionally delete the
    `.old` backup immediately after the move succeeds -- it must only delete
-   the backup after confirming (via the existing tasklist-based check) that
-   the new exe actually started successfully, so a corrupt new exe still
+   the backup after confirming the exact newly-started process is healthy, so
+   a corrupt new exe still
    leaves a usable rollback.
 """
 import pytest
@@ -180,7 +180,7 @@ class TestUpdateBatDeferredBackupDeletion:
         )
         assert not unconditional_del_after_move
 
-    def test_backup_deletion_is_gated_on_tasklist_confirmation(
+    def test_backup_deletion_is_gated_on_launch_healthcheck_confirmation(
         self, monkeypatch, tmp_path
     ):
         script = self._generated_script(monkeypatch, tmp_path)
@@ -189,8 +189,10 @@ class TestUpdateBatDeferredBackupDeletion:
         move_idx = next(
             i for i, line in enumerate(lines) if line.lower().startswith("move /y")
         )
-        tasklist_idx = next(
-            i for i, line in enumerate(lines) if line.lower().startswith("tasklist")
+        healthcheck_idx = next(
+            i
+            for i, line in enumerate(lines)
+            if "start-process -filepath" in line.lower()
         )
         # Only consider backup-deletion steps that occur AFTER the move --
         # the pre-existing "if exist .old del .old" stale-backup cleanup at
@@ -204,9 +206,9 @@ class TestUpdateBatDeferredBackupDeletion:
         ]
 
         assert del_backup_indices, "expected a backup-deletion step in the script"
-        # Every post-move backup-deletion step must appear AFTER the (first)
-        # tasklist confirmation check, not immediately after the move.
-        assert all(idx > tasklist_idx for idx in del_backup_indices)
+        # Every post-move backup-deletion step must appear AFTER the exact
+        # process health check, not immediately after the move.
+        assert all(idx > healthcheck_idx for idx in del_backup_indices)
 
     def test_script_still_self_deletes(self, monkeypatch, tmp_path):
         script = self._generated_script(monkeypatch, tmp_path)

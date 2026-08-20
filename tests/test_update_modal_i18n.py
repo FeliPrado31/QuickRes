@@ -17,6 +17,13 @@ UPDATE_MODAL_KEYS = [
     "update_available_body",
     "btn_update_now",
     "btn_later",
+    "btn_retry_download",
+    "update_downloading",
+    "update_downloading_unknown",
+    "update_verifying",
+    "update_ready",
+    "update_installing",
+    "update_failed",
 ]
 
 

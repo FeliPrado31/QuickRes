@@ -68,6 +68,19 @@ def test_run_app_calls_start(monkeypatch):
     assert started == [1]
 
 
+def test_run_app_requests_a_readable_window_size():
+    fake_window = _FakeWindow()
+    requested = {}
+
+    app.run_app(
+        create_window_fn=lambda *a, **kwargs: (requested.update(kwargs) or fake_window),
+        start_fn=lambda: None,
+    )
+
+    assert requested["width"] == 520
+    assert requested["height"] == 700
+
+
 def test_closing_resolves_an_armed_pending_guard_before_process_exit(monkeypatch):
     # Round-2 regression fix: the auto-revert threading.Timer is a daemon
     # thread, so closing the window while a disable is still in its grace

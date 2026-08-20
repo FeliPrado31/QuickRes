@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import urllib.parse
 import urllib.request
 
@@ -37,6 +38,7 @@ _DOWNLOAD_URL_ALLOWED_HOSTS = {"lxzy.my", "github.com"}
 # all. This does not depend on or change the lxzy.my host check above, which
 # stays host-only exactly as it already was.
 _GITHUB_REPO_PATH_PREFIX = "/lxzydev/QuickRes/"
+_DOWNLOAD_CHUNK_BYTES = 256 * 1024
 
 
 def _validate_download_url(url: str) -> None:
@@ -210,6 +212,121 @@ def _compute_sha256(path: str) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _report_progress(callback, stage: str, downloaded_bytes: int = 0,
+                     total_bytes: int | None = None, error: str | None = None) -> None:
+    """Best-effort progress notification for the pywebview update UI.
+
+    A progress observer must never be able to break a verified update.  The
+    actual file operation remains the source of truth; failures in a UI
+    callback are logged and otherwise ignored.
+    """
+    if callback is None:
+        return
+    try:
+        callback({
+            "stage": stage,
+            "downloaded_bytes": downloaded_bytes,
+            "total_bytes": total_bytes,
+            "error": error,
+        })
+    except Exception as exc:
+        log_msg(f"Update progress callback failed: {exc}")
+
+
+def _response_content_length(response) -> int | None:
+    headers = getattr(response, "headers", None)
+    raw_value = headers.get("Content-Length") if headers is not None else None
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _write_download(response, out_file, progress_callback=None) -> None:
+    """Copy an HTTP response while reporting byte progress when available."""
+    total_bytes = _response_content_length(response)
+    downloaded_bytes = 0
+    _report_progress(progress_callback, "downloading", downloaded_bytes, total_bytes)
+
+    # Existing unit-test response doubles intentionally only provide
+    # read(), while the real urllib response provides Content-Length.  Keep
+    # the no-length path compatible and avoid buffering real known-size
+    # downloads in memory.
+    if total_bytes is None:
+        payload = response.read()
+        out_file.write(payload)
+        _report_progress(progress_callback, "downloading", len(payload), None)
+        return
+
+    while True:
+        chunk = response.read(_DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        out_file.write(chunk)
+        downloaded_bytes += len(chunk)
+        _report_progress(progress_callback, "downloading", downloaded_bytes, total_bytes)
+
+
+class UpdateJob:
+    """Thread-safe download/verify phase of an automatic update.
+
+    The job deliberately stops at ``ready``.  The bridge starts the final
+    replacement only after the UI observes that state, giving it a chance to
+    refresh the progress message while keeping monitor/hotkey shutdown under
+    the normal locked bridge path.
+    """
+
+    def __init__(self, download_url: str, version_info=None):
+        self._download_url = download_url
+        self._version_info = version_info
+        self._lock = threading.Lock()
+        self._thread = None
+        self._state = {
+            "stage": "idle",
+            "downloaded_bytes": 0,
+            "total_bytes": None,
+            "error": None,
+        }
+
+    @property
+    def version_info(self):
+        return self._version_info
+
+    def start(self) -> bool:
+        with self._lock:
+            if self._thread is not None:
+                return False
+            self._state["stage"] = "downloading"
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            return True
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._state)
+
+    def _set_progress(self, progress: dict) -> None:
+        with self._lock:
+            self._state.update(progress)
+
+    def _run(self) -> None:
+        try:
+            apply_update(
+                self._download_url,
+                version_info=self._version_info,
+                progress_callback=self._set_progress,
+                download_only=True,
+            )
+        except Exception as exc:
+            log_msg(f"Update download failed: {exc}")
+            self._set_progress({"stage": "failed", "error": str(exc)})
+            return
+        self._set_progress({"stage": "ready", "error": None})
 
 
 def _looks_like_pe_executable(path: str) -> bool:
@@ -402,8 +519,51 @@ def _build_reverify_command(new_exe_path: str, expected_sha256) -> str:
     return f'powershell -NoProfile -NonInteractive -Command "{ps_command}"\n'
 
 
-def apply_update(download_url, version_info=None):
-    _validate_download_url(download_url)
+def _build_launch_healthcheck_command(exe_path: str) -> str:
+    """Start the replacement client and verify that *that process* stays alive.
+
+    ``tasklist | find`` only searches by image name.  Besides taking a long
+    time to poll, it can see an unrelated QuickRes process (or miss a process
+    whose image-name lookup is delayed by Explorer, OneDrive or Defender).
+    PowerShell's ``Start-Process -PassThru`` gives the updater the exact
+    process it created for the exact replacement path.  A short health check
+    then distinguishes an immediate loader/startup failure from a client that
+    is merely still initializing its UI, without making the batch script wait
+    through the old 36-second adaptive ``tasklist`` loop.
+
+    The executable and working-directory paths both live in nested
+    PowerShell-single-quote and cmd.exe-batch contexts, so use the same
+    two-layer escaping as the pre-move re-verification command.
+    """
+    exe_dir = os.path.dirname(exe_path)
+    ps_safe_path = _escape_batch_percent(_escape_ps_single_quoted(exe_path))
+    ps_safe_dir = _escape_batch_percent(_escape_ps_single_quoted(exe_dir))
+    ps_command = (
+        "$ErrorActionPreference='Stop'; "
+        "try { "
+        f"$p=Start-Process -FilePath '{ps_safe_path}' "
+        f"-WorkingDirectory '{ps_safe_dir}' -PassThru; "
+        "Start-Sleep -Seconds 2; "
+        "if ($p.HasExited) { exit 1 }; "
+        "exit 0 "
+        "} catch { exit 1 }"
+    )
+    return f'powershell -NoProfile -NonInteractive -Command "{ps_command}"\n'
+
+
+def apply_update(download_url, version_info=None, *, progress_callback=None,
+                 download_only: bool = False, reuse_download: bool = False):
+    """Download, verify and stage an update.
+
+    ``download_only`` is used by :class:`UpdateJob` to keep the network
+    operation off the UI bridge thread.  ``reuse_download`` performs only
+    the short replacement/restart phase against the already verified staged
+    ``QuickRes_new.exe``.  The default remains the original one-shot flow.
+    """
+    if reuse_download and download_only:
+        raise ValueError("An update cannot be download-only and reuse a download")
+    if not reuse_download:
+        _validate_download_url(download_url)
 
     exe_path = os.path.abspath(sys.executable)
     exe_dir = os.path.dirname(exe_path)
@@ -421,35 +581,36 @@ def apply_update(download_url, version_info=None):
     # `{ok:false, message:...}` envelope that reaches the JS panel, so
     # update failures are reported to the UI instead of failing silently
     # (e.g. urllib.error.URLError/socket.timeout).
-    request = urllib.request.Request(
-        download_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) QuickRes-Updater"
-        },
-    )
-    # The bare module-level urlopen() uses Python's process-wide default
-    # opener, which does NOT have _AllowlistRedirectHandler installed and
-    # would silently follow redirects to any host. A dedicated opener with
-    # that handler must be built and used here so redirect targets are
-    # actually re-validated for THIS request.
-    opener = urllib.request.build_opener(_AllowlistRedirectHandler())
-    # Same TOCTOU/symlink concern quickres/config.py's write_json_atomic
-    # already guards against: plain open(new_exe_path, "wb") would
-    # transparently follow an NTFS reparse point (symlink/junction) planted
-    # at that path and truncate whatever it points at with the downloaded
-    # bytes, before any later check could refuse it. Opened instead through
-    # the same _open_no_reparse_follow() atomic call config.py uses, which
-    # opens a reparse point as itself and reports it via a None return
-    # rather than ever following it -- see that function's own docstring.
-    with opener.open(request, timeout=30) as resp:
-        out_file = _open_no_reparse_follow(new_exe_path, binary=True)
-        if out_file is None:
-            raise OSError(
-                f"{new_exe_path} is a reparse point/symlink; refusing to "
-                f"write the downloaded update through it"
-            )
-        with out_file:
-            out_file.write(resp.read())
+    if not reuse_download:
+        request = urllib.request.Request(
+            download_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) QuickRes-Updater"
+            },
+        )
+        # The bare module-level urlopen() uses Python's process-wide default
+        # opener, which does NOT have _AllowlistRedirectHandler installed and
+        # would silently follow redirects to any host. A dedicated opener with
+        # that handler must be built and used here so redirect targets are
+        # actually re-validated for THIS request.
+        opener = urllib.request.build_opener(_AllowlistRedirectHandler())
+        # Same TOCTOU/symlink concern quickres/config.py's write_json_atomic
+        # already guards against: plain open(new_exe_path, "wb") would
+        # transparently follow an NTFS reparse point (symlink/junction) planted
+        # at that path and truncate whatever it points at with the downloaded
+        # bytes, before any later check could refuse it. Opened instead through
+        # the same _open_no_reparse_follow() atomic call config.py uses, which
+        # opens a reparse point as itself and reports it via a None return
+        # rather than ever following it -- see that function's own docstring.
+        with opener.open(request, timeout=30) as resp:
+            out_file = _open_no_reparse_follow(new_exe_path, binary=True)
+            if out_file is None:
+                raise OSError(
+                    f"{new_exe_path} is a reparse point/symlink; refusing to "
+                    f"write the downloaded update through it"
+                )
+            with out_file:
+                _write_download(resp, out_file, progress_callback)
 
     # Pragmatic, cheap defense-in-depth: verify the downloaded bytes are at
     # least a plausible Windows PE executable before ever staging/launching
@@ -458,6 +619,7 @@ def apply_update(download_url, version_info=None):
     # out of scope here), but it does catch a truncated/corrupted-but-200-OK
     # response body. Fail closed: clean up the bad download and refuse to
     # proceed.
+    _report_progress(progress_callback, "verifying")
     if not _looks_like_pe_executable(new_exe_path):
         try:
             os.remove(new_exe_path)
@@ -494,13 +656,17 @@ def apply_update(download_url, version_info=None):
             "does not supply this field yet)."
         )
 
+    if download_only:
+        return {"staged_path": new_exe_path}
+
+    _report_progress(progress_callback, "installing")
+
     # The backup (".old") rename must NOT be
     # deleted unconditionally right after the move succeeds -- "moved
     # successfully" says nothing about whether the moved exe is actually
     # valid/launchable. Deletion is deferred until AFTER the existing
-    # tasklist-based launch check confirms the new exe actually started (see
-    # `:confirmed`); if it never gets confirmed (even after the adaptive
-    # multi-attempt polling loop described at `:launch` below), `:launchfail`
+    # process-specific launch health check confirms the new exe actually
+    # started (see `:confirmed`); if it never gets confirmed, `:launchfail`
     # automatically restores the ".old"
     # backup back onto the canonical exe path -- a build that passed every
     # structural/hash check can still fail to actually run (a missing
@@ -562,6 +728,7 @@ def apply_update(download_url, version_info=None):
     # batch script's limited primitives would not be a proportionate fix
     # here.
     reverify_cmd = _build_reverify_command(new_exe_path, expected_sha256)
+    launch_healthcheck_cmd = _build_launch_healthcheck_command(exe_path)
 
     # All path-derived values below are interpolated as plain batch text
     # (double-quoted command arguments), not through PowerShell -- each is
@@ -635,50 +802,24 @@ def apply_update(download_url, version_info=None):
         # that: set only on this path, checked at the very top of
         # `:launchfail`.
         "set QR_RESTORED=1\n"
-        # `:launch`'s confirmation window used to be exactly two
-        # back-to-back fixed `timeout /t 2` waits (~4-6s total including the
-        # pre-start wait) before giving up and letting `:launchfail` roll
-        # the update back. That is not a safe assumption for a freshly
-        # downloaded, UNSIGNED executable (see the standing deferred-
-        # signing gap noted above `_looks_like_pe_executable`): real-time
-        # AV/Defender on-access scanning of a previously-unseen binary can
-        # delay first launch well past a few seconds, especially on a
-        # user's very first run of a newly downloaded build. A false
-        # negative here silently discards a perfectly good update and
-        # restores the old one, with no adaptive backoff and no signal
-        # distinguishing "the build is actually broken" from "the build was
-        # just slow to register" -- and update-checking would go on
-        # offering the same update again with the same too-tight budget.
-        #
-        # Fixed below with a real polling loop (`:launchpoll`) instead of a
-        # single fixed sleep: the per-check cadence stays the same 2-second
-        # `timeout /t 2` interval the original single check already used
-        # (so a build that genuinely never starts is still recognized just
-        # as promptly as before), but each of up to 3 `start` attempts is
-        # now followed by up to `LAUNCHATTEMPT * 3` such 2-second polls
-        # instead of exactly one -- so the grace period actually GROWS
-        # across retries (6s, then 12s, then 18s -- 36s of polling total,
-        # plus the 3 `start` calls) instead of being the same hard-coded
-        # ~4-6s ceiling every time. A genuinely fast-starting exe still
-        # confirms on the very first check (the loop exits the moment
-        # `tasklist` finds it); only a build that is truly never going to
-        # show up spends the full, now much more generous, budget before
-        # `:launchfail` runs.
+        # Start through PowerShell so the health check follows the exact
+        # newly-launched process, rather than repeatedly scanning the whole
+        # machine by image name with `tasklist`.  Defender or OneDrive can
+        # delay CreateProcess itself for a portable app on the Desktop; that
+        # delay is naturally included in Start-Process, after which a live
+        # process is confirmed after two seconds.  A genuine launch failure
+        # gets one short retry before rollback, keeping the failure path
+        # bounded to roughly five seconds instead of the old 36-second poll.
         ":launch\n"
         'echo %DATE% %TIME% update.bat: launching updated exe >>"%QR_LOG%"\n'
-        "set LAUNCHATTEMPT=0\n"
-        ":launchstart\n"
-        "set /a LAUNCHATTEMPT+=1\n"
-        f'start "" "{exe_path_bat}"\n'
-        "set /a LAUNCHPOLLLIMIT=LAUNCHATTEMPT*3\n"
-        "set LAUNCHPOLLCOUNT=0\n"
-        ":launchpoll\n"
-        "timeout /t 2 /nobreak >nul\n"
-        f'tasklist | find /i "{exe_name_bat}" >nul\n'
+        "set LAUNCHRETRIES=0\n"
+        ":launchtry\n"
+        f"{launch_healthcheck_cmd}"
         "if not errorlevel 1 goto :confirmed\n"
-        "set /a LAUNCHPOLLCOUNT+=1\n"
-        "if %LAUNCHPOLLCOUNT% LSS %LAUNCHPOLLLIMIT% goto :launchpoll\n"
-        "if %LAUNCHATTEMPT% LSS 3 goto :launchstart\n"
+        "set /a LAUNCHRETRIES+=1\n"
+        "if %LAUNCHRETRIES% GEQ 2 goto :launchfail\n"
+        "timeout /t 1 /nobreak >nul\n"
+        "goto :launchtry\n"
         "goto :launchfail\n"
         ":confirmed\n"
         'echo %DATE% %TIME% update.bat: launch confirmed, removing backup >>"%QR_LOG%"\n'

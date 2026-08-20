@@ -19,8 +19,22 @@ from enum import Enum
 RESULT_FILE_PREFIX = "monitor_op_result_"
 RESULT_FILE_SUFFIX = ".json"
 
+# A short-lived, elevated helper uses these two strictly-scoped files while
+# a monitor-disable confirmation is open.  The command file may only request
+# keeping or reverting the exact monitor ids that helper already disabled;
+# it never carries a new privileged operation or an arbitrary path.
+GUARD_COMMAND_FILE_PREFIX = "monitor_guard_command_"
+GUARD_RESULT_FILE_PREFIX = "monitor_guard_result_"
+GUARD_FILE_SUFFIX = ".json"
+
 _RESULT_FILENAME_RE = re.compile(
     rf"^{re.escape(RESULT_FILE_PREFIX)}\d+_\d+{re.escape(RESULT_FILE_SUFFIX)}$"
+)
+_GUARD_COMMAND_FILENAME_RE = re.compile(
+    rf"^{re.escape(GUARD_COMMAND_FILE_PREFIX)}\d+_\d+{re.escape(GUARD_FILE_SUFFIX)}$"
+)
+_GUARD_RESULT_FILENAME_RE = re.compile(
+    rf"^{re.escape(GUARD_RESULT_FILE_PREFIX)}\d+_\d+{re.escape(GUARD_FILE_SUFFIX)}$"
 )
 
 
@@ -233,3 +247,19 @@ def is_safe_result_path(path: str, app_dir: str) -> bool:
     if os.path.dirname(os.path.abspath(path)) != os.path.abspath(app_dir):
         return False
     return True
+
+
+def _is_safe_guard_path(path: str, app_dir: str, filename_re) -> bool:
+    if '"' in path or "'" in path:
+        return False
+    if not filename_re.match(os.path.basename(path)):
+        return False
+    return os.path.dirname(os.path.abspath(path)) == os.path.abspath(app_dir)
+
+
+def is_safe_guard_command_path(path: str, app_dir: str) -> bool:
+    return _is_safe_guard_path(path, app_dir, _GUARD_COMMAND_FILENAME_RE)
+
+
+def is_safe_guard_result_path(path: str, app_dir: str) -> bool:
+    return _is_safe_guard_path(path, app_dir, _GUARD_RESULT_FILENAME_RE)

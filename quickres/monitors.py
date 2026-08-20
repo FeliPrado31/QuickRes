@@ -1,14 +1,17 @@
 import ctypes
+from contextlib import contextmanager
 from ctypes import wintypes
+from dataclasses import dataclass
 import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 
 from quickres import recovery
-from quickres.config import APP_DIR, load_pending, log_msg
+from quickres.config import APP_DIR, load_pending, log_msg, write_json_atomic
 
 user32 = ctypes.windll.user32
 setupapi = ctypes.windll.setupapi
@@ -29,6 +32,49 @@ SEE_MASK_NOCLOSEPROCESS = 0x00000040
 SW_HIDE = 0
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 WAIT_OBJECT_0 = 0x00000000
+
+
+@dataclass
+class GuardedDisableSession:
+    """One already-elevated helper, limited to the confirmation window.
+
+    Its command channel deliberately allows only ``keep`` or ``revert`` for
+    the monitor ids that this exact helper has just disabled.  It is not a
+    reusable elevation token and cannot execute arbitrary operations.
+    """
+
+    instance_ids: tuple[str, ...]
+    command_path: str
+    completion_path: str
+    app_dir: str
+    completion_timeout_s: float = 10.0
+    command_requested: bool = False
+
+
+@dataclass
+class _GuardedDisableContext:
+    timeout_s: float
+    session: GuardedDisableSession | None = None
+
+
+_guarded_disable_local = threading.local()
+
+
+@contextmanager
+def guarded_disable_session(timeout_s: float = 10.0):
+    """Opt a single disable call into the short-lived elevated guard.
+
+    This preserves ``set_monitors_enabled``'s public call shape, including
+    its existing test and integration seams, while keeping the special mode
+    explicit at the bridge boundary that owns the confirmation timer.
+    """
+    previous = getattr(_guarded_disable_local, "context", None)
+    context = _GuardedDisableContext(timeout_s=float(timeout_s))
+    _guarded_disable_local.context = context
+    try:
+        yield context
+    finally:
+        _guarded_disable_local.context = previous
 
 # SetupAPI instance IDs are vendor/EDID-derived (e.g.
 # "DISPLAY\DEL4110\5&2e2fefea&0&UID1078018") and normally only ever contain
@@ -465,6 +511,30 @@ def _build_helper_params(op: str, instance_ids: list, result_path: str) -> str:
     return f'"{script_path}" {params}'
 
 
+def _build_guarded_disable_params(
+    instance_ids: list,
+    result_path: str,
+    command_path: str,
+    completion_path: str,
+    guard_timeout_s: float,
+) -> str:
+    """Arguments for the narrowly-scoped elevated confirmation helper."""
+    parts = ["--monitor-op guarded-disable"]
+    for instance_id in instance_ids:
+        parts.append(f'--instance-id "{instance_id}"')
+    parts.extend((
+        f'--result-file "{result_path}"',
+        f'--guard-command-file "{command_path}"',
+        f'--guard-result-file "{completion_path}"',
+        f"--guard-timeout-s {guard_timeout_s:.3f}",
+    ))
+    params = " ".join(parts)
+    if getattr(sys, "frozen", False):
+        return params
+    script_path = os.path.abspath(sys.argv[0])
+    return f'"{script_path}" {params}'
+
+
 def _launch_elevated_helper(params: str):
     """Injectable seam around ShellExecuteExW `runas`. Returns an opaque
     process handle for `_wait_for_helper`, or None if elevation was
@@ -510,6 +580,59 @@ def make_result_filename(pid: int | None = None, ms: int | None = None) -> str:
     pid = os.getpid() if pid is None else pid
     ms = int(time.time() * 1000) if ms is None else ms
     return f"{recovery.RESULT_FILE_PREFIX}{pid}_{ms}{recovery.RESULT_FILE_SUFFIX}"
+
+
+def make_guard_filename(kind: str, pid: int | None = None, ms: int | None = None) -> str:
+    """Return a canonical command/result filename for one guard session."""
+    prefixes = {
+        "command": recovery.GUARD_COMMAND_FILE_PREFIX,
+        "result": recovery.GUARD_RESULT_FILE_PREFIX,
+    }
+    if kind not in prefixes:
+        raise ValueError(f"Unknown guard filename kind: {kind!r}")
+    pid = os.getpid() if pid is None else pid
+    ms = int(time.time() * 1000) if ms is None else ms
+    return f"{prefixes[kind]}{pid}_{ms}{recovery.GUARD_FILE_SUFFIX}"
+
+
+def _assemble_operation_results(instance_ids: list, enabled: bool, helper_data, completed: bool) -> list:
+    """Cross-check a helper report with the current device state.
+
+    Both the ordinary one-shot helper and the temporary confirmation helper
+    use this one outcome policy, so neither path can accidentally report a
+    raw elevated return code as a confirmed device state.
+    """
+    helper_results = {}
+    if helper_data:
+        for entry in helper_data.get("results", []):
+            entry_id = entry.get("instance_id")
+            if entry_id:
+                helper_results[entry_id] = (bool(entry.get("ok", False)), entry.get("message", ""))
+
+    observed = sample_device_states(instance_ids)
+    results = []
+    for instance_id in instance_ids:
+        helper_result = helper_results.get(instance_id)
+        observed_state = observed.get(instance_id)
+        if helper_result is not None:
+            helper_ok, helper_message = helper_result
+            if helper_ok and observed_state is not None and observed_state != enabled:
+                ok, message, kind = False, HELPER_OBSERVED_MISMATCH_MESSAGE, OUTCOME_AMBIGUOUS
+            elif not helper_ok and observed_state is not None and observed_state == enabled:
+                ok, message, kind = False, HELPER_OBSERVED_FAILURE_MISMATCH_MESSAGE, OUTCOME_AMBIGUOUS
+            else:
+                ok, message = helper_ok, helper_message
+                kind = OUTCOME_CONFIRMED if helper_ok else OUTCOME_GENUINE_FAILURE
+        elif observed_state is not None and observed_state == enabled:
+            ok, message, kind = True, "Confirmed by observed device state", OUTCOME_CONFIRMED
+        elif not completed:
+            ok, message, kind = False, TIMEOUT_MESSAGE, OUTCOME_AMBIGUOUS
+        elif observed_state is None:
+            ok, message, kind = False, HELPER_RESULT_UNCONFIRMED_MESSAGE, OUTCOME_AMBIGUOUS
+        else:
+            ok, message, kind = False, "Elevated helper did not report a result", OUTCOME_GENUINE_FAILURE
+        results.append((instance_id, ok, message, kind))
+    return results
 
 
 def set_monitors_enabled(
@@ -569,6 +692,17 @@ def set_monitors_enabled(
             for instance_id in instance_ids
         ]
 
+    guarded_context = getattr(_guarded_disable_local, "context", None)
+    if not enabled and guarded_context is not None:
+        return _set_monitors_disabled_with_guard(
+            instance_ids,
+            app_dir=app_dir,
+            timeout_s=timeout_s,
+            result_path=result_path,
+            on_helper_launched=on_helper_launched,
+            context=guarded_context,
+        )
+
     _cleanup_stale_result_files()
     if result_path is None:
         result_path = os.path.join(app_dir, make_result_filename())
@@ -589,50 +723,160 @@ def set_monitors_enabled(
     completed = _wait_for_helper(handle, timeout_s)
     helper_data = read_op_result(result_path, app_dir) if completed else None
 
-    helper_results = {}
-    if helper_data:
-        for entry in helper_data.get("results", []):
-            entry_id = entry.get("instance_id")
-            if entry_id:
-                helper_results[entry_id] = (bool(entry.get("ok", False)), entry.get("message", ""))
+    return _assemble_operation_results(instance_ids, enabled, helper_data, completed)
 
-    observed = sample_device_states(instance_ids)
 
-    results = []
-    for instance_id in instance_ids:
-        helper_result = helper_results.get(instance_id)
-        observed_state = observed.get(instance_id)
-        if helper_result is not None:
-            helper_ok, helper_message = helper_result
-            if helper_ok and observed_state is not None and observed_state != enabled:
-                ok, message, kind = False, HELPER_OBSERVED_MISMATCH_MESSAGE, OUTCOME_AMBIGUOUS
-            elif not helper_ok and observed_state is not None and observed_state == enabled:
-                ok, message, kind = False, HELPER_OBSERVED_FAILURE_MISMATCH_MESSAGE, OUTCOME_AMBIGUOUS
-            else:
-                ok, message = helper_ok, helper_message
-                kind = OUTCOME_CONFIRMED if helper_ok else OUTCOME_GENUINE_FAILURE
-        elif observed_state is not None and observed_state == enabled:
-            ok, message, kind = True, "Confirmed by observed device state", OUTCOME_CONFIRMED
-        elif not completed:
-            ok, message, kind = False, TIMEOUT_MESSAGE, OUTCOME_AMBIGUOUS
-        elif observed_state is None:
-            # The helper completed but reported nothing for this id, and the
-            # fresh device-state re-check couldn't determine its state
-            # either -- there is no signal left to confirm this as a genuine
-            # failure. See HELPER_RESULT_UNCONFIRMED_MESSAGE.
-            ok, message, kind = False, HELPER_RESULT_UNCONFIRMED_MESSAGE, OUTCOME_AMBIGUOUS
-        else:
-            # The helper completed but reported nothing for this id, while
-            # the fresh device-state re-check DID return a state -- and it
-            # is not the one we asked for. Unlike the branch above, this IS
-            # a confirmed outcome: the same observed-state signal that
-            # confirms a SUCCESS two branches up (`observed_state ==
-            # enabled`) equally confirms a FAILURE here by the same
-            # trusted, directly-observed source -- the helper simply never
-            # reported anything for this particular id.
-            ok, message, kind = False, "Elevated helper did not report a result", OUTCOME_GENUINE_FAILURE
-        results.append((instance_id, ok, message, kind))
+def _read_guard_result(path: str, app_dir: str):
+    """Read and consume only a canonical guard-completion result file."""
+    if not recovery.is_safe_guard_result_path(path, app_dir):
+        return None
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log_msg(f"Failed to read/parse monitor guard result file {path}: {e}")
+        data = None
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    return data
+
+
+def _wait_for_guard_initial_result(handle, result_path: str, app_dir: str, timeout_s: float):
+    """Wait only until the long-lived helper has reported the disable.
+
+    The process deliberately remains alive after this point.  Its handle is
+    still closed here: all later coordination uses the narrow file protocol,
+    not a leaked process handle.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    try:
+        while True:
+            data = read_op_result(result_path, app_dir)
+            if data is not None:
+                return True, data
+            if kernel32.WaitForSingleObject(handle, 0) == WAIT_OBJECT_0:
+                return True, read_op_result(result_path, app_dir)
+            if time.monotonic() >= deadline:
+                return False, None
+            time.sleep(0.05)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _remove_if_safe(path: str, app_dir: str, safe_path) -> None:
+    if safe_path(path, app_dir):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _set_monitors_disabled_with_guard(
+    instance_ids: list,
+    *,
+    app_dir: str,
+    timeout_s: float,
+    result_path: str | None,
+    on_helper_launched,
+    context: _GuardedDisableContext,
+) -> list:
+    """Start a disable helper that stays elevated only for one guard window."""
+    guard_timeout_s = context.timeout_s
+    if not 1.0 <= guard_timeout_s <= 60.0:
+        raise ValueError("Guard timeout must be between 1 and 60 seconds")
+
+    _cleanup_stale_result_files()
+    if result_path is None:
+        result_path = os.path.join(app_dir, make_result_filename())
+    command_path = os.path.join(app_dir, make_guard_filename("command"))
+    completion_path = os.path.join(app_dir, make_guard_filename("result"))
+    if not recovery.is_safe_result_path(result_path, app_dir):
+        raise ValueError(f"Refusing to use unsafe result file path: {result_path!r}")
+    if not recovery.is_safe_guard_command_path(command_path, app_dir):
+        raise ValueError(f"Refusing to use unsafe guard command path: {command_path!r}")
+    if not recovery.is_safe_guard_result_path(completion_path, app_dir):
+        raise ValueError(f"Refusing to use unsafe guard result path: {completion_path!r}")
+
+    _remove_if_safe(command_path, app_dir, recovery.is_safe_guard_command_path)
+    _remove_if_safe(completion_path, app_dir, recovery.is_safe_guard_result_path)
+    params = _build_guarded_disable_params(
+        instance_ids, result_path, command_path, completion_path, guard_timeout_s
+    )
+    handle = _launch_elevated_helper(params)
+    if handle is None:
+        return [
+            (instance_id, False, "Elevation was cancelled or failed", OUTCOME_GENUINE_FAILURE)
+            for instance_id in instance_ids
+        ]
+
+    if on_helper_launched is not None:
+        on_helper_launched(kernel32.GetProcessId(handle))
+    completed, helper_data = _wait_for_guard_initial_result(
+        handle, result_path, app_dir, timeout_s
+    )
+    results = _assemble_operation_results(instance_ids, False, helper_data, completed)
+    context.session = GuardedDisableSession(
+        instance_ids=tuple(instance_ids),
+        command_path=command_path,
+        completion_path=completion_path,
+        app_dir=app_dir,
+    )
     return results
+
+
+def _wait_for_guard_completion(session: GuardedDisableSession):
+    deadline = time.monotonic() + session.completion_timeout_s
+    while True:
+        data = _read_guard_result(session.completion_path, session.app_dir)
+        if data is not None:
+            _remove_if_safe(
+                session.command_path, session.app_dir, recovery.is_safe_guard_command_path
+            )
+            return data
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def _signal_guarded_disable(session: GuardedDisableSession, action: str):
+    """Request the one allowed terminal action from a guard helper."""
+    if action not in {"keep", "revert"}:
+        raise ValueError(f"Unknown guard action: {action!r}")
+    if session.command_requested:
+        return None
+
+    existing = _read_guard_result(session.completion_path, session.app_dir)
+    if existing is not None:
+        session.command_requested = True
+        _remove_if_safe(session.command_path, session.app_dir, recovery.is_safe_guard_command_path)
+        return existing
+    if not recovery.is_safe_guard_command_path(session.command_path, session.app_dir):
+        return None
+    if not write_json_atomic(session.command_path, {"action": action}):
+        return None
+    session.command_requested = True
+    return _wait_for_guard_completion(session)
+
+
+def keep_guarded_disable(session: GuardedDisableSession) -> bool:
+    """Close a guard helper without re-enabling its already-disabled ids."""
+    completion = _signal_guarded_disable(session, "keep")
+    return bool(completion and completion.get("action") == "keep")
+
+
+def revert_guarded_disable(session: GuardedDisableSession):
+    """Re-enable through the same elevated helper, with no second UAC."""
+    completion = _signal_guarded_disable(session, "revert")
+    if completion is None:
+        return None
+    return _assemble_operation_results(list(session.instance_ids), True, completion, True)
 
 
 def read_op_result(path: str, app_dir: str):
@@ -812,7 +1056,7 @@ def _referenced_result_paths(pending_record) -> set:
 
 
 def _cleanup_stale_result_files(max_age_s: float = 300.0):
-    """Best-effort sweep for orphaned monitor_op_result_*.json files.
+    """Best-effort sweep for orphaned helper IPC files.
 
     A timed-out set_monitors_enabled() call returns before it can clean
     up its own result_path, because the elevated helper may still be
@@ -837,13 +1081,18 @@ def _cleanup_stale_result_files(max_age_s: float = 300.0):
         referenced = _referenced_result_paths(load_pending())
         now = time.time()
         for name in os.listdir(APP_DIR):
-            if not (
+            is_operation_result = (
                 name.startswith(recovery.RESULT_FILE_PREFIX)
                 and name.endswith(recovery.RESULT_FILE_SUFFIX)
-            ):
+            )
+            is_guard_ipc = (
+                name.startswith(recovery.GUARD_COMMAND_FILE_PREFIX)
+                or name.startswith(recovery.GUARD_RESULT_FILE_PREFIX)
+            ) and name.endswith(recovery.GUARD_FILE_SUFFIX)
+            if not is_operation_result and not is_guard_ipc:
                 continue
             path = os.path.join(APP_DIR, name)
-            if os.path.normcase(os.path.abspath(path)) in referenced:
+            if is_operation_result and os.path.normcase(os.path.abspath(path)) in referenced:
                 continue
             try:
                 if now - os.path.getmtime(path) > max_age_s:
