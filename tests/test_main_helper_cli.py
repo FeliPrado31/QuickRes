@@ -247,7 +247,9 @@ def test_guarded_disable_auto_reverts_when_no_command_arrives(monkeypatch, tmp_p
 
     assert exit_code == 0
     assert calls == [("disable", "A"), ("enable", "A")]
-    assert json.loads(completion_file.read_text(encoding="utf-8"))["action"] == "auto_revert"
+    completion = json.loads(completion_file.read_text(encoding="utf-8"))
+    assert completion["action"] == "auto_revert"
+    assert completion["reason"] == "no_command"
 
 
 def test_guarded_disable_ignores_an_invalid_action_and_still_auto_reverts(monkeypatch, tmp_path):
@@ -283,7 +285,9 @@ def test_guarded_disable_ignores_an_invalid_action_and_still_auto_reverts(monkey
 
     assert exit_code == 0
     assert calls == [("disable", "A"), ("enable", "A")]
-    assert json.loads(completion_file.read_text(encoding="utf-8"))["action"] == "auto_revert"
+    completion = json.loads(completion_file.read_text(encoding="utf-8"))
+    assert completion["action"] == "auto_revert"
+    assert completion["reason"] == "invalid_action"
 
 
 def test_guarded_disable_command_file_only_acts_on_the_launched_instance_id(monkeypatch, tmp_path):
@@ -362,4 +366,6 @@ def test_guarded_disable_malformed_command_file_does_not_crash_and_auto_reverts(
 
     assert exit_code == 0
     assert calls == [("disable", "A"), ("enable", "A")]
-    assert json.loads(completion_file.read_text(encoding="utf-8"))["action"] == "auto_revert"
+    completion = json.loads(completion_file.read_text(encoding="utf-8"))
+    assert completion["action"] == "auto_revert"
+    assert completion["reason"] == "malformed_command"

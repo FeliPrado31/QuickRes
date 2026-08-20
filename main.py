@@ -87,6 +87,8 @@ def _run_elevated_helper(argv) -> int:
     # only keep the already-applied disable or re-enable these exact ids.
     deadline = time.monotonic() + args.guard_timeout_s
     action = None
+    saw_malformed_command = False
+    saw_invalid_action = False
     while time.monotonic() < deadline:
         try:
             if os.path.exists(args.guard_command_file):
@@ -96,14 +98,31 @@ def _run_elevated_helper(argv) -> int:
                 if requested in {"keep", "revert"}:
                     action = requested
                     break
+                saw_invalid_action = True
         except (OSError, ValueError, json.JSONDecodeError):
             # A partially-written/malformed command is ignored; timeout
             # remains the fail-safe and will auto-revert.
-            pass
+            saw_malformed_command = True
         time.sleep(0.05)
 
-    action = action or "auto_revert"
+    reason = None
+    if action is None:
+        action = "auto_revert"
+        # auto_revert fires for three different causes that otherwise look
+        # identical from the result file alone (no command ever arrived vs.
+        # an unreadable/corrupt command file vs. a well-formed but
+        # unrecognized action) -- record which one so a black-screen report
+        # is actually diagnosable instead of just "it reverted".
+        reason = (
+            "malformed_command" if saw_malformed_command
+            else "invalid_action" if saw_invalid_action
+            else "no_command"
+        )
+        log_msg(f"Guard window expired without a valid keep/revert command (reason={reason}); auto-reverting")
+
     completion = {"action": action, "results": []}
+    if reason is not None:
+        completion["reason"] = reason
     if action != "keep":
         for instance_id in args.instance_id:
             try:
