@@ -6,6 +6,10 @@ import traceback
 
 from quickres.monitors import run_elevated_worker_op
 
+GUARD_REASON_NO_COMMAND = "no_command"
+GUARD_REASON_UNREADABLE_COMMAND = "unreadable_command"
+GUARD_REASON_INVALID_ACTION = "invalid_action"
+
 
 def _run_elevated_helper(argv) -> int:
     """Elevated-helper CLI branch: loops every `--instance-id`
@@ -86,35 +90,31 @@ def _run_elevated_helper(argv) -> int:
     # only keep the already-applied disable or re-enable these exact ids.
     deadline = time.monotonic() + args.guard_timeout_s
     action = None
-    last_reason = "no_command"
+    last_reason = GUARD_REASON_NO_COMMAND
     while time.monotonic() < deadline:
-        last_reason = "no_command"
         try:
             with open(args.guard_command_file, "r", encoding="utf-8") as f:
                 command = json.load(f)
         except FileNotFoundError:
-            pass
+            last_reason = GUARD_REASON_NO_COMMAND
         except (OSError, ValueError, json.JSONDecodeError):
-            # A partially-written/malformed command is ignored; timeout
+            # Covers both an unreadable read (e.g. a transient sharing
+            # violation racing the atomic replace in bridge.py) and a
+            # malformed one; either way it is ignored and the timeout
             # remains the fail-safe and will auto-revert.
-            last_reason = "malformed_command"
+            last_reason = GUARD_REASON_UNREADABLE_COMMAND
         else:
-            # `requested` must be checked with isinstance before the `in`
-            # test below: a well-formed JSON command whose "action" is a
-            # list/dict (e.g. {"action": ["revert"]}) is unhashable, and
-            # `in {"keep", "revert"}` would raise TypeError -- uncaught by
-            # the except clause above -- killing this still-elevated
-            # helper before it can write a result or re-enable the
-            # monitor, forcing the separate guard in bridge.py to
-            # re-elevate with a second UAC prompt.
+            # A tuple, not a set: an "action" that is a list/dict (valid
+            # JSON, just not a string) then compares by equality instead
+            # of needing `requested` to be hashable, so it cannot crash
+            # with an uncaught TypeError.
             requested = command.get("action") if isinstance(command, dict) else None
-            if isinstance(requested, str) and requested in {"keep", "revert"}:
+            if requested in ("keep", "revert"):
                 action = requested
                 break
-            last_reason = "invalid_action"
+            last_reason = GUARD_REASON_INVALID_ACTION
         time.sleep(0.05)
 
-    reason = None
     if action is None:
         action = "auto_revert"
         # auto_revert fires for three different causes that otherwise look
@@ -125,12 +125,11 @@ def _run_elevated_helper(argv) -> int:
         # last_reason reflects only the most recent poll outcome, not
         # the first failure ever seen, so a transient early glitch cannot
         # mislabel a window that later settled into a different state.
-        reason = last_reason
-        log_msg(f"Guard window expired without a valid keep/revert command (reason={reason}); auto-reverting")
+        log_msg(f"Guard window expired without a valid keep/revert command (reason={last_reason}); auto-reverting")
 
     completion = {"action": action, "results": []}
-    if reason is not None:
-        completion["reason"] = reason
+    if action == "auto_revert":
+        completion["reason"] = last_reason
     if action != "keep":
         for instance_id in args.instance_id:
             try:

@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import sys
@@ -41,14 +42,24 @@ def _guarded_disable_argv(tmp_path, suffix, *, timeout_s="1"):
     return command_file, completion_file, argv
 
 
-def _force_single_poll_timeout(monkeypatch):
-    # Forces exactly one guard-loop iteration to run before the deadline
-    # trips: 3 monotonic() values cover the deadline calculation, one
-    # while-condition check that lets the loop body execute once, and a
-    # final while-condition check that fails and exits the loop.
-    monotonic_values = iter((0.0, 0.0, 1.0))
+def _force_deadline_after(monkeypatch, *poll_values):
+    # Forces exactly len(poll_values) guard-loop iterations: the first
+    # monotonic() call computes the deadline (0.0 + guard_timeout_s), each
+    # of poll_values lets one while-condition check pass and its loop body
+    # run, and monotonic() then keeps returning the timeout value forever
+    # -- so a future extra monotonic() call per iteration fails the
+    # deadline check (and the test's own assertions) instead of raising an
+    # opaque StopIteration.
+    guard_timeout_s = 1.0
+    monotonic_values = itertools.chain(
+        [0.0], poll_values, itertools.repeat(guard_timeout_s)
+    )
     monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+
+
+def _force_single_poll_timeout(monkeypatch):
+    _force_deadline_after(monkeypatch, 0.0)
 
 
 def test_single_instance_id_produces_one_result_entry(monkeypatch, tmp_path):
@@ -249,7 +260,7 @@ def test_guarded_disable_auto_reverts_when_no_command_arrives(monkeypatch, tmp_p
     assert calls == [("disable", "A"), ("enable", "A")]
     completion = json.loads(completion_file.read_text(encoding="utf-8"))
     assert completion["action"] == "auto_revert"
-    assert completion["reason"] == "no_command"
+    assert completion["reason"] == main.GUARD_REASON_NO_COMMAND
 
 
 def test_guarded_disable_ignores_an_invalid_action_and_still_auto_reverts(monkeypatch, tmp_path):
@@ -274,7 +285,7 @@ def test_guarded_disable_ignores_an_invalid_action_and_still_auto_reverts(monkey
     assert calls == [("disable", "A"), ("enable", "A")]
     completion = json.loads(completion_file.read_text(encoding="utf-8"))
     assert completion["action"] == "auto_revert"
-    assert completion["reason"] == "invalid_action"
+    assert completion["reason"] == main.GUARD_REASON_INVALID_ACTION
 
 
 def test_guarded_disable_unhashable_action_value_does_not_crash(monkeypatch, tmp_path):
@@ -300,7 +311,7 @@ def test_guarded_disable_unhashable_action_value_does_not_crash(monkeypatch, tmp
     assert calls == [("disable", "A"), ("enable", "A")]
     completion = json.loads(completion_file.read_text(encoding="utf-8"))
     assert completion["action"] == "auto_revert"
-    assert completion["reason"] == "invalid_action"
+    assert completion["reason"] == main.GUARD_REASON_INVALID_ACTION
 
 
 def test_guarded_disable_reason_reflects_the_most_recent_poll(monkeypatch, tmp_path):
@@ -317,9 +328,7 @@ def test_guarded_disable_reason_reflects_the_most_recent_poll(monkeypatch, tmp_p
         "run_elevated_worker_op",
         lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
     )
-    monotonic_values = iter((0.0, 0.0, 0.5, 1.0))
-    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    _force_deadline_after(monkeypatch, 0.0, 0.5)
     command_file, completion_file, argv = _guarded_disable_argv(tmp_path, "235")
     command_file.write_text(json.dumps({"action": "nuke"}), encoding="utf-8")
 
@@ -341,7 +350,7 @@ def test_guarded_disable_reason_reflects_the_most_recent_poll(monkeypatch, tmp_p
     assert calls == [("disable", "A"), ("enable", "A")]
     completion = json.loads(completion_file.read_text(encoding="utf-8"))
     assert completion["action"] == "auto_revert"
-    assert completion["reason"] == "invalid_action"
+    assert completion["reason"] == main.GUARD_REASON_INVALID_ACTION
 
 
 def test_guarded_disable_command_file_only_acts_on_the_launched_instance_id(monkeypatch, tmp_path):
@@ -400,4 +409,4 @@ def test_guarded_disable_malformed_command_file_does_not_crash_and_auto_reverts(
     assert calls == [("disable", "A"), ("enable", "A")]
     completion = json.loads(completion_file.read_text(encoding="utf-8"))
     assert completion["action"] == "auto_revert"
-    assert completion["reason"] == "malformed_command"
+    assert completion["reason"] == main.GUARD_REASON_UNREADABLE_COMMAND
