@@ -53,6 +53,11 @@ This project is fully open source. Feel free to modify it for your own use.
 
 ## Building from source
 
+QuickRes uses [pywebview](https://pywebview.flowrl.com/) for its GUI (the panel is a single `quickres/webview/panel.html` file rendered in an embedded EdgeChromium window), not Tkinter. Windows only.
+
 ```bash
-pip install pyinstaller
-python -m PyInstaller --onefile --noconsole --name QuickRes --icon icon.ico --add-data "icon.ico;." main.py```
+pip install -r requirements.txt
+python -m PyInstaller QuickRes.spec
+```
+
+`QuickRes.spec` bundles `quickres/webview/panel.html` and `quickres/webview/QuickRes.png` at the correct path for the frozen build and excludes Tkinter (unused since the GUI rewrite). The resulting single-file `dist/QuickRes.exe` is portable, no install needed.

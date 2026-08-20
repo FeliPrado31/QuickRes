@@ -25,6 +25,7 @@ wherever fits in the Russian sentence.
 """
 
 import ctypes
+import threading
 
 LANG_RUSSIAN = 0x19
 
@@ -36,35 +37,24 @@ STRINGS = {
         "custom_res_placeholder": "e.g. 1440x1080",
         "btn_apply": "Apply",
         "hotkey_toggle_label": "Hotkey Toggle",
-        "hotkey_label": "Hotkey:",
         "btn_start_hotkey": "Start Hotkey",
         "btn_stop_hotkey": "Stop Hotkey",
         "native_label": "Native:",
         "stretched_label": "Stretched:",
         "btn_faq": "FAQ",
         "btn_monitors": "Monitors",
-        "btn_settings": "Settings",
-        "btn_github": "GitHub",
-        "restore_banner_text": "A monitor may still be disabled from a previous session - click to restore it",
-        # --- Status messages (main window) ---
-        "status_custom_cleared": "Custom resolutions cleared",
-        "status_hotkey_stopped": "Hotkey: stopped",
-        "status_res_format_error": "Native/Stretched must look like 1920x1080",
-        "status_custom_format_error": "Format like 1440x1080",
-        "status_removed_custom": "Removed {res} from custom list",
+        # --- Boot failure (persistent retry state, panel.html) ---
+        "boot_error_title": "Startup failed",
+        "boot_error_body": "Something went wrong while starting QuickRes. You can try again.",
+        "btn_retry": "Retry",
         # --- Resolution-not-found dialog ---
         "dialog_res_not_found_title": "Resolution not found",
-        "dialog_res_not_found_body": (
-            "Couldn't detect {width} x {height} on your GPU driver.\n\n"
-            "Would you like to open your graphics software to add it?"
-        ),
         "btn_nvidia_panel": "NVIDIA Control Panel",
         "btn_amd_software": "AMD Software",
         "btn_intel_graphics": "Intel Graphics Software",
         "btn_cancel": "Cancel",
         # --- FAQ window ---
         "faq_window_title": "FAQ",
-        "btn_close": "Close",
         "faq_q1": 'Why does it say "Resolution not found"?',
         "faq_a1": (
             "QuickRes checks your GPU driver's list of registered resolutions "
@@ -97,61 +87,37 @@ STRINGS = {
             "Press it once on the fill/agent select screen to go stretched, "
             "press it again after the match to go back to native.\n\n"
         ),
-        # --- Settings window ---
-        "settings_window_title": "Settings",
-        "settings_theme_label": "Theme:",
         "theme_light": "Light",
         "theme_dark": "Dark",
-        "btn_reset_custom_res": "Reset Custom Resolutions",
-        "btn_check_update": "Check for Update",
-        "settings_language_label": "Language:",
         # --- Monitors window ---
         "monitors_window_title": "Monitors",
-        "monitors_none_found": "No monitors found.",
         "monitor_status_enabled": "Enabled",
         "monitor_status_disabled": "Disabled",
         "btn_disable": "Disable",
         "btn_enable": "Enable",
-        "status_write_flag_failed": (
-            "Could not write the crash-recovery flag — refusing to disable "
-            "{name}. Check disk space/permissions and try again."
-        ),
-        "status_requesting_disable": "Requesting admin approval to disable {name}...",
-        "status_requesting_enable": "Requesting admin approval to enable {name}...",
-        "status_disable_pending": (
-            "Still waiting on admin approval to disable {name} — "
-            "reopen Monitors in a moment to see the real state."
-        ),
-        "status_disable_unconfirmed": "{name} disabled (result was unconfirmed, verified by re-check)",
-        "status_enable_pending": (
-            "Still waiting on admin approval to enable {name} — "
-            "check again in a moment."
-        ),
-        "status_enable_unconfirmed": "{name} enabled (result was unconfirmed, verified by re-check)",
         # --- Revert / keep-disabled dialog ---
         "revert_dialog_title": "Keep this monitor disabled?",
-        "revert_countdown": "Reverting in {seconds}s",
         "btn_keep_disabled": "Keep disabled",
         "btn_revert_now": "Revert now",
-        "status_reverting": "Reverting {name}...",
-        "status_revert_pending": (
-            "Still waiting on admin approval to revert {name} — "
-            "check again in a moment."
-        ),
-        "status_device_gone": "{name} is no longer present on this system — cleared the stale recovery flag.",
-        "status_reverted": "Reverted {name}",
-        "status_reverted_unconfirmed": "Reverted {name} (result was unconfirmed, verified by re-check)",
-        "status_revert_failed": "Failed to revert {name}: {message}. Please retry manually.",
-        # --- Restore-on-startup flow ---
-        "status_restoring": "Restoring {name}...",
-        "status_restore_pending": (
-            "Still waiting on admin approval to restore {name} — "
-            "check again in a moment."
-        ),
-        "status_restored": "Restored {name}",
-        "status_restored_unconfirmed": "Restored {name} (result was unconfirmed, verified by re-check)",
-        "status_restore_failed": "Failed to restore {name}: {message}. Please retry manually.",
-        "status_unexpected_error": "Unexpected error: {error}",
+        # --- Webview panel chrome ---
+        "quick_resolutions_label": "Quick resolutions",
+        "hotkey_state_stopped": "Stopped",
+        "hotkey_state_running": "Listening",
+        "notice_title": "A monitor may still be disabled",
+        "btn_updates": "Updates",
+        "monitors_detected_count": "{count} detected",
+        "btn_force_unlock": "Force unlock",
+        "revert_note": "If you do nothing, QuickRes re-enables it automatically. Use this if your screen went black.",
+        "btn_disable_all": "Disable all",
+        "preset_kind_native": "Native",
+        "preset_kind_stretched": "Stretched",
+        "preset_kind_low": "Low",
+        # --- Update-available modal (wires the Updates button to
+        # the existing download/verify/apply pipeline) ---
+        "update_available_title": "Update available",
+        "update_available_body": "QuickRes {version} is ready to install.",
+        "btn_update_now": "Update Now",
+        "btn_later": "Later",
     },
     "ru": {
         # --- Main window ---
@@ -160,35 +126,24 @@ STRINGS = {
         "custom_res_placeholder": "например, 1440x1080",
         "btn_apply": "Применить",
         "hotkey_toggle_label": "Горячая клавиша",
-        "hotkey_label": "Горячая клавиша:",
         "btn_start_hotkey": "Включить",
         "btn_stop_hotkey": "Отключить",
         "native_label": "Нативное:",
         "stretched_label": "Растянутое:",
         "btn_faq": "FAQ",
         "btn_monitors": "Мониторы",
-        "btn_settings": "Настройки",
-        "btn_github": "GitHub",
-        "restore_banner_text": "Монитор мог остаться отключённым после предыдущего запуска - нажмите, чтобы восстановить его",
-        # --- Status messages (main window) ---
-        "status_custom_cleared": "Пользовательские разрешения сброшены",
-        "status_hotkey_stopped": "Горячая клавиша: отключена",
-        "status_res_format_error": "Нативное и растянутое разрешения должны быть указаны в формате 1920x1080",
-        "status_custom_format_error": "Укажите разрешение в формате 1440x1080",
-        "status_removed_custom": "{res} удалено из списка пользовательских разрешений",
+        # --- Boot failure (persistent retry state, panel.html) ---
+        "boot_error_title": "Не удалось запустить приложение",
+        "boot_error_body": "Что-то пошло не так при запуске QuickRes. Вы можете попробовать снова.",
+        "btn_retry": "Повторить",
         # --- Resolution-not-found dialog ---
         "dialog_res_not_found_title": "Разрешение не найдено",
-        "dialog_res_not_found_body": (
-            "Не удалось найти разрешение {width} x {height} в списке драйвера видеокарты.\n\n"
-            "Открыть программу управления графикой, чтобы добавить его?"
-        ),
         "btn_nvidia_panel": "Панель управления NVIDIA",
         "btn_amd_software": "AMD Software",
         "btn_intel_graphics": "Intel Graphics Software",
         "btn_cancel": "Отмена",
         # --- FAQ window ---
         "faq_window_title": "FAQ",
-        "btn_close": "Закрыть",
         "faq_q1": "Почему появляется сообщение «Разрешение не найдено»?",
         "faq_a1": (
             "Перед переключением QuickRes проверяет список разрешений, зарегистрированных "
@@ -221,61 +176,37 @@ STRINGS = {
             "на экране выбора агента, чтобы перейти на растянутое разрешение, и ещё раз "
             "после матча, чтобы вернуться к нативному.\n\n"
         ),
-        # --- Settings window ---
-        "settings_window_title": "Настройки",
-        "settings_theme_label": "Тема:",
         "theme_light": "Светлая",
         "theme_dark": "Тёмная",
-        "btn_reset_custom_res": "Сбросить пользовательские разрешения",
-        "btn_check_update": "Проверить обновления",
-        "settings_language_label": "Язык:",
         # --- Monitors window ---
         "monitors_window_title": "Мониторы",
-        "monitors_none_found": "Мониторы не найдены.",
         "monitor_status_enabled": "Включён",
         "monitor_status_disabled": "Отключён",
         "btn_disable": "Отключить",
         "btn_enable": "Включить",
-        "status_write_flag_failed": (
-            "Не удалось записать флаг восстановления после сбоя, поэтому {name} не будет отключён. "
-            "Проверьте свободное место на диске и права доступа, затем повторите попытку."
-        ),
-        "status_requesting_disable": "Запрашивается разрешение администратора на отключение {name}...",
-        "status_requesting_enable": "Запрашивается разрешение администратора на включение {name}...",
-        "status_disable_pending": (
-            "Ожидание разрешения администратора на отключение {name} продолжается. "
-            "Через некоторое время снова откройте раздел «Мониторы», чтобы увидеть фактическое состояние."
-        ),
-        "status_disable_unconfirmed": "{name} отключён (результат не был подтверждён напрямую, состояние проверено повторно)",
-        "status_enable_pending": (
-            "Ожидание разрешения администратора на включение {name} продолжается. "
-            "Проверьте состояние ещё раз через некоторое время."
-        ),
-        "status_enable_unconfirmed": "{name} включён (результат не был подтверждён напрямую, состояние проверено повторно)",
         # --- Revert / keep-disabled dialog ---
         "revert_dialog_title": "Оставить этот монитор отключённым?",
-        "revert_countdown": "Восстановление через {seconds} с",
         "btn_keep_disabled": "Оставить отключённым",
         "btn_revert_now": "Восстановить сейчас",
-        "status_reverting": "Восстановление {name}...",
-        "status_revert_pending": (
-            "Ожидание разрешения администратора на восстановление {name} продолжается. "
-            "Проверьте состояние ещё раз через некоторое время."
-        ),
-        "status_device_gone": "{name} больше не обнаружен в системе. Устаревший флаг восстановления удалён.",
-        "status_reverted": "{name} восстановлен",
-        "status_reverted_unconfirmed": "{name} восстановлен (результат не был подтверждён напрямую, состояние проверено повторно)",
-        "status_revert_failed": "Не удалось восстановить {name}: {message}. Повторите попытку вручную.",
-        # --- Restore-on-startup flow ---
-        "status_restoring": "Восстановление {name}...",
-        "status_restore_pending": (
-            "Ожидание разрешения администратора на восстановление {name} продолжается. "
-            "Проверьте состояние ещё раз через некоторое время."
-        ),
-        "status_restored": "{name} восстановлен",
-        "status_restored_unconfirmed": "{name} восстановлен (результат не был подтверждён напрямую, состояние проверено повторно)",
-        "status_restore_failed": "Не удалось восстановить {name}: {message}. Повторите попытку вручную.",
-        "status_unexpected_error": "Непредвиденная ошибка: {error}",
+        # --- Webview panel chrome ---
+        "quick_resolutions_label": "Быстрые разрешения",
+        "hotkey_state_stopped": "Остановлено",
+        "hotkey_state_running": "Прослушивание",
+        "notice_title": "Монитор может быть всё ещё отключён",
+        "btn_updates": "Обновления",
+        "monitors_detected_count": "обнаружено: {count}",
+        "btn_force_unlock": "Принудительно разблокировать",
+        "revert_note": "Если ничего не делать, QuickRes включит его автоматически. Используйте эту кнопку, если экран стал чёрным.",
+        "btn_disable_all": "Отключить все",
+        "preset_kind_native": "Нативное",
+        "preset_kind_stretched": "Растянутое",
+        "preset_kind_low": "Низкое",
+        # --- Update-available modal (wires the Updates button to
+        # the existing download/verify/apply pipeline) ---
+        "update_available_title": "Доступно обновление",
+        "update_available_body": "QuickRes {version} готов к установке.",
+        "btn_update_now": "Обновить сейчас",
+        "btn_later": "Позже",
     },
 }
 
@@ -286,6 +217,13 @@ LANGUAGE_NAMES = {
 }
 
 _current_lang = "auto"
+
+# pywebview dispatches every JS->Python bridge call on
+# its own thread (the same concurrency model that config._update_lock /
+# Api._op_lock / Api._hotkey_lock all already guard against), and
+# set_language()/get_language()/t() had no equivalent protection for this
+# module-level variable. Guard both the write and every read with one lock.
+_lang_lock = threading.Lock()
 
 
 def detect_system_language() -> str:
@@ -307,15 +245,34 @@ def resolve_language(setting: str) -> str:
 
 def set_language(lang: str):
     global _current_lang
-    _current_lang = lang if lang in STRINGS else "en"
+    with _lang_lock:
+        _current_lang = lang if lang in STRINGS else "en"
 
 
 def get_language() -> str:
-    return _current_lang
+    with _lang_lock:
+        return _current_lang
 
 
-def t(key: str, **kwargs) -> str:
-    template = STRINGS.get(_current_lang, {}).get(key)
+def t(key: str, lang: str | None = None, **kwargs) -> str:
+    """Look up `key`'s translated string.
+
+    `lang`, when passed, PINS the lookup to
+    that exact language instead of re-reading the shared `_current_lang`
+    global -- callers that build a multi-key bundle (bridge.py's
+    `_ui_strings`/`_faq_bundle`) must resolve the language ONCE and pass the
+    same pinned value into every `t()` call in that bundle, otherwise a
+    concurrent `set_language()` call on another bridge-dispatch thread can
+    land mid-bundle and mix strings from two different languages into one
+    response. `lang=None` (the default) preserves the old behavior of
+    reading the current global under `_lang_lock` -- used by any caller that
+    genuinely wants "whatever language is active right now" for a single,
+    standalone lookup.
+    """
+    if lang is None:
+        with _lang_lock:
+            lang = _current_lang
+    template = STRINGS.get(lang, {}).get(key)
     if not template:
         template = STRINGS["en"].get(key, key)
     return template.format(**kwargs) if kwargs else template

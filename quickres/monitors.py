@@ -6,9 +6,9 @@ import re
 import sys
 import time
 import uuid
-from dataclasses import dataclass
 
-from quickres.config import APP_DIR
+from quickres import recovery
+from quickres.config import APP_DIR, load_pending, log_msg
 
 user32 = ctypes.windll.user32
 setupapi = ctypes.windll.setupapi
@@ -24,23 +24,28 @@ SPDRP_FRIENDLYNAME = 0x0000000C
 CR_SUCCESS = 0
 CM_PROB_DISABLED = 22
 CM_LOCATE_DEVNODE_NORMAL = 0
-DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
-DISPLAY_DEVICE_PRIMARY_DEVICE = 0x00000004
-EDD_GET_DEVICE_INTERFACE_NAME = 0x00000001
+CM_DRP_CLASSGUID = 0x00000009
 SEE_MASK_NOCLOSEPROCESS = 0x00000040
 SW_HIDE = 0
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 WAIT_OBJECT_0 = 0x00000000
-WAIT_TIMEOUT = 0x00000102
-WAIT_FAILED = 0xFFFFFFFF
 
 # SetupAPI instance IDs are vendor/EDID-derived (e.g.
 # "DISPLAY\DEL4110\5&2e2fefea&0&UID1078018") and normally only ever contain
 # these characters. This is interpolated into a double-quoted elevated-helper
-# command line (run_elevated_monitor_op) with no escaping, so a value outside
+# command line (_build_helper_params) with no escaping, so a value outside
 # this shape is refused rather than risking a quote-breaking/argv-corrupting
 # injection into an admin-privileged process launch.
-_SAFE_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_&\\]+$")
+#
+# The final character is deliberately restricted to a NON-backslash: a
+# trailing backslash (odd OR even run length) breaks Windows argv quoting
+# once interpolated into `--instance-id "{id}"` followed by
+# `--result-file "{path}"` (verified empirically via CommandLineToArgvW --
+# a trailing backslash immediately before the closing `"` gets consumed as
+# a literal, swallowing the next argument). A real device instance id never
+# legitimately ends in a backslash, so forbidding it outright is the
+# simplest safe fix.
+_SAFE_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_&\\]*[A-Za-z0-9_&]$")
 
 # Distinct from an ordinary failure: WaitForSingleObject timing out means the
 # elevated process (likely still waiting on a slow UAC prompt) is UNKNOWN,
@@ -56,6 +61,63 @@ TIMEOUT_MESSAGE = "Elevated operation timed out (still running in the background
 # callers may treat it as safe to clear a stale crash-recovery flag over
 # rather than leaving the user permanently stuck retrying.
 DEVICE_NOT_FOUND_PREFIX = "Could not locate device"
+
+# The helper process and the freshly observed device
+# state are two independent signals for the same outcome. A driver's
+# CM_Disable_DevNode/CM_Enable_DevNode call can return CR_SUCCESS without
+# the device's actual enabled/disabled state ever changing, so a helper
+# report of ok=True is only trusted when the observed state agrees with it
+# (or when no observed state is available to check against at all). When
+# both are available and they disagree, the outcome is unconfirmed rather
+# than a false-positive success.
+HELPER_OBSERVED_MISMATCH_MESSAGE = (
+    "Helper reported success but observed device state disagrees (outcome unconfirmed)"
+)
+
+# Mirror of the cross-check above for the opposite direction: a
+# helper-reported failure can itself be spurious (a transient CfgMgr32
+# quirk, or the disable/enable taking effect a moment after the helper's own
+# result write reported an error) while the freshly observed device state
+# actually shows the requested `enabled` value was reached. A helper report
+# of ok=False is therefore only trusted when the observed state agrees with
+# it (or when no observed state is available to check against at all). When
+# both are available and they disagree, the outcome is unconfirmed rather
+# than a genuine failure -- otherwise a caller could discard the
+# crash-recovery record and skip the auto-revert guard for a monitor that
+# is, in truth, still in its pre-op state.
+HELPER_OBSERVED_FAILURE_MISMATCH_MESSAGE = (
+    "Helper reported failure but observed device state disagrees (outcome unconfirmed)"
+)
+
+# The elevated helper can exit within the wait timeout (so this is distinct
+# from TIMEOUT_MESSAGE) yet still fail to persist its own result file -- for
+# example write_json_atomic failing under disk-full or permission-denied
+# conditions inside the elevated process, after its underlying
+# CM_Disable_DevNode/CM_Enable_DevNode call may have already genuinely
+# succeeded. When that happens AND the fresh device-state re-check
+# (sample_device_states) also can't determine the device's current state,
+# there is no signal left to confirm the outcome either way, so it must be
+# treated as unknown rather than a confirmed failure -- the same way
+# TIMEOUT_MESSAGE already is by downstream callers (e.g.
+# webview/bridge.py's _finalize_disable_outcome), so the crash-recovery
+# record and auto-revert guard for it are not discarded on the strength of
+# a result file that simply never got written.
+HELPER_RESULT_UNCONFIRMED_MESSAGE = (
+    "Elevated helper did not report a result and its outcome could not be "
+    "confirmed by device state (outcome unknown)"
+)
+
+# Explicit per-target outcome classification, carried as the 4th element of
+# every result tuple `set_monitors_enabled` returns (alongside the
+# human-readable `message`, which stays display/logging text only). A
+# caller that needs to know whether a result counts as a genuine failure or
+# an unconfirmed/ambiguous outcome reads this field directly instead of
+# comparing `message` against sentinel constants -- a new message added to
+# the branches below always carries its own kind right where it is
+# produced, so there is nothing else to keep in sync at each call site.
+OUTCOME_CONFIRMED = "confirmed"
+OUTCOME_GENUINE_FAILURE = "genuine_failure"
+OUTCOME_AMBIGUOUS = "ambiguous"
 
 
 class GUID(ctypes.Structure):
@@ -83,17 +145,6 @@ class SP_DEVINFO_DATA(ctypes.Structure):
     ]
 
 
-class DISPLAY_DEVICEW(ctypes.Structure):
-    _fields_ = [
-        ("cb", wintypes.DWORD),
-        ("DeviceName", wintypes.WCHAR * 32),
-        ("DeviceString", wintypes.WCHAR * 128),
-        ("StateFlags", wintypes.DWORD),
-        ("DeviceID", wintypes.WCHAR * 128),
-        ("DeviceKey", wintypes.WCHAR * 128),
-    ]
-
-
 class SHELLEXECUTEINFOW(ctypes.Structure):
     _fields_ = [
         ("cbSize", wintypes.DWORD),
@@ -114,12 +165,13 @@ class SHELLEXECUTEINFOW(ctypes.Structure):
     ]
 
 
-@dataclass
-class Monitor:
-    instance_id: str
-    friendly_name: str
-    is_enabled: bool
-    is_primary: bool
+def is_valid_instance_id(instance_id: str) -> bool:
+    """Allowlist gate for a Windows device instance id before it is
+    interpolated, unescaped, into an elevated-helper command line.
+    """
+    if not instance_id:
+        return False
+    return bool(_SAFE_INSTANCE_ID_RE.match(instance_id))
 
 
 # HDEVINFO is a pointer-sized opaque handle. ctypes' default restype (c_int,
@@ -164,11 +216,34 @@ cfgmgr32.CM_Enable_DevNode.argtypes = [wintypes.DWORD, wintypes.ULONG]
 cfgmgr32.CM_Disable_DevNode.restype = wintypes.DWORD
 cfgmgr32.CM_Disable_DevNode.argtypes = [wintypes.DWORD, wintypes.ULONG]
 
+cfgmgr32.CM_Get_DevNode_Registry_PropertyW.restype = wintypes.DWORD
+cfgmgr32.CM_Get_DevNode_Registry_PropertyW.argtypes = [
+    wintypes.DWORD, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG),
+    ctypes.c_void_p, ctypes.POINTER(wintypes.ULONG), wintypes.ULONG,
+]
+
 shell32.ShellExecuteExW.restype = wintypes.BOOL
 shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
 
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+
+kernel32.GetProcessId.restype = wintypes.DWORD
+kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+
+kernel32.GetProcessTimes.restype = wintypes.BOOL
+kernel32.GetProcessTimes.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+]
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
 
 
 def _normalize_interface_id(device_id: str) -> str:
@@ -187,44 +262,22 @@ def _normalize_interface_id(device_id: str) -> str:
     return s.replace("#", "\\")
 
 
-def _get_attached_monitor_states() -> dict:
-    states = {}
-    adapter = DISPLAY_DEVICEW()
-    adapter.cb = ctypes.sizeof(DISPLAY_DEVICEW)
-    adapter_index = 0
-    while user32.EnumDisplayDevicesW(None, adapter_index, ctypes.byref(adapter), 0):
-        if adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP:
-            monitor = DISPLAY_DEVICEW()
-            monitor.cb = ctypes.sizeof(DISPLAY_DEVICEW)
-            monitor_index = 0
-            while user32.EnumDisplayDevicesW(
-                adapter.DeviceName, monitor_index, ctypes.byref(monitor),
-                EDD_GET_DEVICE_INTERFACE_NAME
-            ):
-                instance_id = _normalize_interface_id(monitor.DeviceID)
-                is_primary = bool(adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE)
-                states[instance_id] = is_primary
-                monitor_index += 1
-                monitor = DISPLAY_DEVICEW()
-                monitor.cb = ctypes.sizeof(DISPLAY_DEVICEW)
-        adapter_index += 1
-        adapter = DISPLAY_DEVICEW()
-        adapter.cb = ctypes.sizeof(DISPLAY_DEVICEW)
-    return states
-
-
-def enumerate_monitors() -> list:
-    monitors = []
+def _list_raw_monitor_devices() -> list:
+    """Enumerate raw (instance_id, friendly_name, devinst) tuples via
+    SetupAPI. This is the only place that owns the SetupDiGetClassDevsW /
+    SetupDiEnumDeviceInfo loop; it is not itself unit tested (it drives live
+    Win32 APIs). `enumerate_monitors()` below is the injectable seam
+    boundary tests exercise.
+    """
+    raw = []
     class_guid = _make_guid(GUID_DEVCLASS_MONITOR)
     hdevinfo = setupapi.SetupDiGetClassDevsW(
         ctypes.byref(class_guid), None, None, DIGCF_PRESENT
     )
     if hdevinfo == INVALID_HANDLE_VALUE or not hdevinfo:
-        return monitors
+        return raw
 
     try:
-        attached_states = _get_attached_monitor_states()
-
         index = 0
         devinfo = SP_DEVINFO_DATA()
         devinfo.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
@@ -236,27 +289,7 @@ def enumerate_monitors() -> list:
             if not friendly_name:
                 friendly_name = instance_id or "Unknown monitor"
 
-            try:
-                is_enabled = _is_devnode_enabled(devinfo.DevInst)
-            except OSError:
-                # Can't determine this device's current status right now —
-                # omit it rather than guess. Callers that need this specific
-                # device (the crash-recovery re-check in gui.py) correctly
-                # treat "not found in the list" as "can't confirm" and fail
-                # safe, instead of trusting a wrong default.
-                index += 1
-                devinfo = SP_DEVINFO_DATA()
-                devinfo.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
-                continue
-
-            is_primary = attached_states.get(instance_id, False)
-
-            monitors.append(Monitor(
-                instance_id=instance_id,
-                friendly_name=friendly_name,
-                is_enabled=is_enabled,
-                is_primary=is_primary,
-            ))
+            raw.append((instance_id, friendly_name, devinfo.DevInst))
 
             index += 1
             devinfo = SP_DEVINFO_DATA()
@@ -264,7 +297,370 @@ def enumerate_monitors() -> list:
     finally:
         setupapi.SetupDiDestroyDeviceInfoList(hdevinfo)
 
+    return raw
+
+
+def _devnode_enabled(devinst) -> bool:
+    """Injectable seam wrapping `_is_devnode_enabled`. Raises OSError when
+    the device's enabled/disabled status cannot be determined right now.
+    Named by dropping `_is_devnode_enabled`'s `is_` prefix, matching the
+    prefix-drop convention `_get_devnode_class_guid` -> `_devnode_class_guid`
+    uses for the same raw-call/seam pairing below.
+    """
+    return _is_devnode_enabled(devinst)
+
+
+def enumerate_monitors() -> list:
+    """Public enumeration surface:
+    `[{"instance_id": str, "friendly_name": str, "enabled": bool}]`.
+    A device whose status can't be determined is omitted entirely, never
+    defaulted to enabled -- a safe-omit default rather than a guess.
+    """
+    monitors = []
+    for instance_id, friendly_name, devinst in _list_raw_monitor_devices():
+        try:
+            enabled = _devnode_enabled(devinst)
+        except OSError:
+            continue
+        monitors.append(
+            {"instance_id": instance_id, "friendly_name": friendly_name, "enabled": enabled}
+        )
     return monitors
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Injectable seam probing whether `pid` is a live, still-running
+    process. Best-effort: an unopenable handle is treated as not-alive.
+    """
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD(0)
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def get_process_start_time(pid: int) -> int | None:
+    """Best-effort process-identity probe: the process's creation time
+    (Windows `GetProcessTimes`), collapsed into a single 64-bit FILETIME
+    integer. Returns None when the process can't be opened or queried right
+    now -- callers must treat that as "identity unconfirmed", never as
+    "matches" or "doesn't match".
+
+    This is the counterpart to `_is_pid_alive`'s bare "does this PID number
+    currently exist" check: a PID number alone is not a stable identity on
+    Windows, which recycles PIDs quickly, so a caller that needs to confirm
+    it is still looking at the SAME process it originally observed (not a
+    different, unrelated process that has since been assigned the same PID)
+    should capture this value once at the moment of first observation and
+    compare it again later via this same function.
+    """
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        ok = kernel32.GetProcessTimes(
+            handle, ctypes.byref(creation), ctypes.byref(exit_time),
+            ctypes.byref(kernel_time), ctypes.byref(user_time),
+        )
+        if not ok:
+            return None
+        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def process_liveness(helper_pid, owner_pid: int, helper_pid_start_time: int | None = None):
+    """A stored owner_pid that no longer matches the current
+    process's pid forces UNKNOWN unconditionally (PID-reuse guard) --
+    this is the composition point `resolve_pending` (recovery.py)
+    deliberately left to its caller.
+
+    `_is_pid_alive`'s raw OpenProcess+GetExitCodeProcess probe
+    on `helper_pid` only proves some process currently holds that PID
+    number -- not that it is the SAME process originally launched as the
+    helper. Windows recycles PIDs quickly, so between the helper's PID being
+    captured and this check running later (e.g. across `recheck_pending`/
+    `recover_on_boot` after a crash), an unrelated process can have been
+    assigned that exact PID. When the caller supplies `helper_pid_start_time`
+    (the creation time captured alongside `helper_pid` when it was first
+    recorded, via `get_process_start_time`), a "PID exists" result is only
+    trusted as ALIVE once its CURRENT creation time is re-queried and found
+    to match -- any mismatch, or a creation time that can no longer be
+    queried at all, forces UNKNOWN rather than a false ALIVE, mirroring the
+    owner_pid guard above. When no `helper_pid_start_time` is supplied (the
+    caller has nothing recorded to compare against -- e.g. an older pending
+    record predating this field), this guard is skipped and behavior is
+    unchanged from before.
+
+    `helper_pid`/`owner_pid` both come straight off an on-disk record with
+    no schema enforcement on read, so either can in principle be some
+    non-int value (disk corruption that still parses as valid JSON, a
+    partial write from an older build, manual editing). `owner_pid` is only
+    ever compared with `!=`, which is already type-safe -- a mismatched
+    type simply compares unequal and falls into the same UNKNOWN branch a
+    mismatched pid number would, so its explicit type check below documents
+    that safety rather than changing behavior. `helper_pid` is different: it
+    gets passed straight into `_is_pid_alive`'s ctypes `OpenProcess` call,
+    which is declared with a `DWORD` argtype and raises
+    `ctypes.ArgumentError` for a non-int argument -- an exception this
+    function's own `except OSError` does not catch. A non-int `helper_pid`
+    is therefore treated the same way an unopenable/unqueryable process
+    already is elsewhere in this function: as liveness that cannot be
+    determined, not as a crash.
+    """
+    if not isinstance(owner_pid, int) or isinstance(owner_pid, bool) or owner_pid != os.getpid():
+        return recovery.Liveness.UNKNOWN
+    if helper_pid is None:
+        return recovery.Liveness.UNKNOWN
+    if not isinstance(helper_pid, int) or isinstance(helper_pid, bool):
+        return recovery.Liveness.UNKNOWN
+    try:
+        alive = _is_pid_alive(helper_pid)
+    except OSError:
+        return recovery.Liveness.UNKNOWN
+    if not alive:
+        return recovery.Liveness.DEAD
+    if helper_pid_start_time is not None:
+        try:
+            current_start_time = get_process_start_time(helper_pid)
+        except OSError:
+            return recovery.Liveness.UNKNOWN
+        if current_start_time is None or current_start_time != helper_pid_start_time:
+            return recovery.Liveness.UNKNOWN
+    return recovery.Liveness.ALIVE
+
+
+def sample_device_states(instance_ids: list) -> dict:
+    """Current enabled/disabled state per id; `None` when undetermined
+    (feeds `device_states` in `recovery.resolve_pending`, consistent with
+    `enumerate_monitors`'s "omit" semantics translated to "unknown" at this
+    dict level).
+    """
+    current = {m["instance_id"]: m["enabled"] for m in enumerate_monitors()}
+    return {instance_id: current.get(instance_id) for instance_id in instance_ids}
+
+
+def _build_helper_params(op: str, instance_ids: list, result_path: str) -> str:
+    """CLI shape: no --batch flag; every instance id is repeated as its
+    own `--instance-id <id>` occurrence, regardless of N.
+    """
+    parts = [f"--monitor-op {op}"]
+    for instance_id in instance_ids:
+        parts.append(f'--instance-id "{instance_id}"')
+    parts.append(f'--result-file "{result_path}"')
+    params = " ".join(parts)
+
+    if getattr(sys, "frozen", False):
+        return params
+    script_path = os.path.abspath(sys.argv[0])
+    return f'"{script_path}" {params}'
+
+
+def _launch_elevated_helper(params: str):
+    """Injectable seam around ShellExecuteExW `runas`. Returns an opaque
+    process handle for `_wait_for_helper`, or None if elevation was
+    cancelled/failed (e.g. UAC decline).
+    """
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS
+    sei.hwnd = None
+    sei.lpVerb = "runas"
+    sei.lpFile = sys.executable
+    sei.lpParameters = params
+    sei.lpDirectory = None
+    sei.nShow = SW_HIDE
+
+    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+        return None
+    return sei.hProcess
+
+
+def _wait_for_helper(handle, timeout_s: float) -> bool:
+    """Injectable seam around WaitForSingleObject. Returns True only if the
+    elevated process completed within `timeout_s`.
+    """
+    wait_result = kernel32.WaitForSingleObject(handle, int(timeout_s * 1000))
+    kernel32.CloseHandle(handle)
+    return wait_result == WAIT_OBJECT_0
+
+
+def make_result_filename(pid: int | None = None, ms: int | None = None) -> str:
+    """Canonical `monitor_op_result_<pid>_<ms>.json` name -- the single
+    generator every caller that needs a fresh result-file path uses
+    (webview/bridge.py's Api.set_monitors_enabled pre-computes one so it
+    can persist a crash-recovery record referencing this same path before
+    elevation starts; this module's own set_monitors_enabled falls back to
+    it when no result_path is supplied). `recovery.RESULT_FILE_PREFIX`/
+    `RESULT_FILE_SUFFIX` are the same two literals `_cleanup_stale_result_files`
+    matches filenames against and `recovery.is_safe_result_path`'s regex
+    validates them against, so all three concerns stay derived from one
+    shared naming convention instead of four independent copies that could
+    silently drift apart.
+    """
+    pid = os.getpid() if pid is None else pid
+    ms = int(time.time() * 1000) if ms is None else ms
+    return f"{recovery.RESULT_FILE_PREFIX}{pid}_{ms}{recovery.RESULT_FILE_SUFFIX}"
+
+
+def set_monitors_enabled(
+    instance_ids: list,
+    enabled: bool,
+    *,
+    app_dir=None,
+    timeout_s: float = 30.0,
+    result_path: str | None = None,
+    on_helper_launched=None,
+) -> list:
+    """Uniform-N elevation path: one entry per id, in input order, one
+    elevated helper launch total regardless of N. Every id is validated
+    against the injection allowlist before any elevation is attempted; one
+    unsafe id aborts the whole operation pre-elevation. The final
+    per-id result combines the helper's own report with a fresh observed
+    device-state re-check -- the raw return code is never trusted alone:
+    when a fresh observed state is available for that id, it is cross-checked
+    against the helper's report in both directions: a helper-claimed success
+    (ok=True) that the observed state contradicts is downgraded to an
+    unconfirmed outcome instead of a false-positive confirmation (see
+    HELPER_OBSERVED_MISMATCH_MESSAGE), and symmetrically a helper-claimed
+    failure (ok=False) that the observed state actually shows reached the
+    requested `enabled` value is likewise downgraded to an unconfirmed
+    outcome instead of a false-positive genuine failure (see
+    HELPER_OBSERVED_FAILURE_MISMATCH_MESSAGE). When no observed state is
+    available for an id, the helper's report is trusted as-is since there is
+    nothing to cross-check it against.
+
+    `result_path`, when supplied, lets a caller (webview/bridge.py's
+    Api.set_monitors_enabled) pre-compute the exact result-file path so it
+    can persist a crash-recovery pending record referencing this same path
+    before elevation starts. When omitted the path is generated internally.
+    Either way, the final path is validated via `recovery.is_safe_result_path`
+    before being interpolated into the elevated helper's command line
+    (`_build_helper_params`) -- instance ids are validated against their own
+    injection allowlist just above, but a caller-supplied result_path was
+    previously interpolated unescaped with no validation at all, mirroring
+    the read-side check `read_op_result` already performs and the elevated
+    helper's own write-side check in main.py.
+
+    `on_helper_launched`, when supplied, is invoked synchronously with the
+    elevated helper's real PID right after launch (via
+    `kernel32.GetProcessId` on the raw `ShellExecuteExW` process handle),
+    BEFORE waiting for it to finish -- this is what lets a caller persist
+    the real helper_pid into its own crash-recovery record as early as
+    possible, instead of it staying permanently None (which otherwise
+    forces `process_liveness()` to UNKNOWN forever). Omitted by default so
+    existing callers that never pass it never touch GetProcessId at all.
+    """
+    app_dir = app_dir or APP_DIR
+    op = "enable" if enabled else "disable"
+
+    if any(not is_valid_instance_id(instance_id) for instance_id in instance_ids):
+        return [
+            (instance_id, False, "invalid instance id", OUTCOME_GENUINE_FAILURE)
+            for instance_id in instance_ids
+        ]
+
+    _cleanup_stale_result_files()
+    if result_path is None:
+        result_path = os.path.join(app_dir, make_result_filename())
+    if not recovery.is_safe_result_path(result_path, app_dir):
+        raise ValueError(f"Refusing to use unsafe result file path: {result_path!r}")
+    params = _build_helper_params(op, instance_ids, result_path)
+
+    handle = _launch_elevated_helper(params)
+    if handle is None:
+        return [
+            (instance_id, False, "Elevation was cancelled or failed", OUTCOME_GENUINE_FAILURE)
+            for instance_id in instance_ids
+        ]
+
+    if on_helper_launched is not None:
+        on_helper_launched(kernel32.GetProcessId(handle))
+
+    completed = _wait_for_helper(handle, timeout_s)
+    helper_data = read_op_result(result_path, app_dir) if completed else None
+
+    helper_results = {}
+    if helper_data:
+        for entry in helper_data.get("results", []):
+            entry_id = entry.get("instance_id")
+            if entry_id:
+                helper_results[entry_id] = (bool(entry.get("ok", False)), entry.get("message", ""))
+
+    observed = sample_device_states(instance_ids)
+
+    results = []
+    for instance_id in instance_ids:
+        helper_result = helper_results.get(instance_id)
+        observed_state = observed.get(instance_id)
+        if helper_result is not None:
+            helper_ok, helper_message = helper_result
+            if helper_ok and observed_state is not None and observed_state != enabled:
+                ok, message, kind = False, HELPER_OBSERVED_MISMATCH_MESSAGE, OUTCOME_AMBIGUOUS
+            elif not helper_ok and observed_state is not None and observed_state == enabled:
+                ok, message, kind = False, HELPER_OBSERVED_FAILURE_MISMATCH_MESSAGE, OUTCOME_AMBIGUOUS
+            else:
+                ok, message = helper_ok, helper_message
+                kind = OUTCOME_CONFIRMED if helper_ok else OUTCOME_GENUINE_FAILURE
+        elif observed_state is not None and observed_state == enabled:
+            ok, message, kind = True, "Confirmed by observed device state", OUTCOME_CONFIRMED
+        elif not completed:
+            ok, message, kind = False, TIMEOUT_MESSAGE, OUTCOME_AMBIGUOUS
+        elif observed_state is None:
+            # The helper completed but reported nothing for this id, and the
+            # fresh device-state re-check couldn't determine its state
+            # either -- there is no signal left to confirm this as a genuine
+            # failure. See HELPER_RESULT_UNCONFIRMED_MESSAGE.
+            ok, message, kind = False, HELPER_RESULT_UNCONFIRMED_MESSAGE, OUTCOME_AMBIGUOUS
+        else:
+            # The helper completed but reported nothing for this id, while
+            # the fresh device-state re-check DID return a state -- and it
+            # is not the one we asked for. Unlike the branch above, this IS
+            # a confirmed outcome: the same observed-state signal that
+            # confirms a SUCCESS two branches up (`observed_state ==
+            # enabled`) equally confirms a FAILURE here by the same
+            # trusted, directly-observed source -- the helper simply never
+            # reported anything for this particular id.
+            ok, message, kind = False, "Elevated helper did not report a result", OUTCOME_GENUINE_FAILURE
+        results.append((instance_id, ok, message, kind))
+    return results
+
+
+def read_op_result(path: str, app_dir: str):
+    """Read and consume an elevated-helper result file.
+
+    Refuses to open `path` unless `recovery.is_safe_result_path` accepts it.
+    On a successful read the file is deleted (it has been consumed); a
+    malformed/unreadable file is also removed since the attempt happened,
+    an unsafe path is left completely untouched.
+    """
+    if not recovery.is_safe_result_path(path, app_dir):
+        return None
+    if not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log_msg(f"Failed to read/parse monitor op result file {path}: {e}")
+        data = None
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    return data
 
 
 def _get_device_instance_id(hdevinfo, devinfo) -> str:
@@ -307,24 +703,75 @@ def _is_devnode_enabled(devinst) -> bool:
     if result != CR_SUCCESS:
         # A CfgMgr32 failure here does NOT mean the device is enabled — it
         # means we genuinely don't know. Silently defaulting to "enabled"
-        # would be dangerous: gui.py's crash-recovery false-negative
-        # re-check trusts this as ground truth to decide whether to clear
-        # pending_restore.json, and a wrong "enabled" reading for a monitor
-        # that's actually still disabled would erase its recovery flag.
-        # Raise instead so callers can fail safe (enumerate_monitors omits
-        # the device rather than guessing).
+        # would be dangerous: crash-recovery (recovery.resolve_pending)
+        # trusts device_states as ground truth to decide whether a disable
+        # is confirmed, and a wrong "enabled" reading for a monitor that's
+        # actually still disabled would erase its recovery flag. Raise
+        # instead so callers can fail safe (enumerate_monitors omits the
+        # device rather than guessing).
         raise OSError(f"CM_Get_DevNode_Status failed (CONFIGRET error {result})")
     return problem_number.value != CM_PROB_DISABLED
 
 
-def _set_devnode_enabled(instance_id: str, enable: bool):
-    """Only ever call this from within an already-elevated process."""
+def _locate_devnode(instance_id: str):
+    """Injectable seam wrapping CM_Locate_DevNodeW. Returns
+    (CONFIGRET result, devinst value) -- callers check `result` against
+    CR_SUCCESS before trusting the devinst.
+    """
     devinst = wintypes.DWORD(0)
     result = cfgmgr32.CM_Locate_DevNodeW(
         ctypes.byref(devinst), instance_id, CM_LOCATE_DEVNODE_NORMAL
     )
+    return result, devinst.value
+
+
+def _get_devnode_class_guid(devinst) -> str:
+    """Raw CM_Get_DevNode_Registry_PropertyW(CM_DRP_CLASSGUID) query --
+    drives a live Win32 API, so (like `_is_devnode_enabled`) it is not
+    itself unit tested; `_devnode_class_guid` below is the injectable seam
+    tests exercise, matching the `_is_devnode_enabled`/`_devnode_enabled`
+    pairing above. Returns the class GUID lowercase and without braces
+    (e.g. "4d36e96e-e325-11ce-bfc1-08002be10318"), or "" if it can't be
+    determined.
+    """
+    buf = ctypes.create_unicode_buffer(64)
+    length = wintypes.ULONG(ctypes.sizeof(buf))
+    reg_type = wintypes.ULONG(0)
+    result = cfgmgr32.CM_Get_DevNode_Registry_PropertyW(
+        devinst, CM_DRP_CLASSGUID, ctypes.byref(reg_type), buf, ctypes.byref(length), 0
+    )
+    if result != CR_SUCCESS:
+        return ""
+    return buf.value.strip("{}").lower()
+
+
+def _devnode_class_guid(devinst) -> str:
+    """Injectable seam wrapping `_get_devnode_class_guid`."""
+    return _get_devnode_class_guid(devinst)
+
+
+def _set_devnode_enabled(instance_id: str, enable: bool):
+    """Only ever call this from within an already-elevated process.
+
+    Before ever calling CM_Enable_DevNode/CM_Disable_DevNode, verifies the
+    resolved devnode actually belongs to GUID_DEVCLASS_MONITOR -- the same
+    registry property SetupAPI's class-scoped enumeration
+    (_list_raw_monitor_devices, via SetupDiGetClassDevsW's class filter)
+    implicitly relies on. This elevated primitive is its own authorization
+    boundary and must not rely entirely on its caller (main.py's CLI arg
+    parsing, gated only by is_valid_instance_id's injection-safety regex)
+    to only ever pass a monitor's instance id -- refuses (raises) instead
+    of silently trusting it.
+    """
+    result, devinst = _locate_devnode(instance_id)
     if result != CR_SUCCESS:
         return False, f"{DEVICE_NOT_FOUND_PREFIX} {instance_id} (CONFIGRET error {result})"
+
+    if _devnode_class_guid(devinst) != GUID_DEVCLASS_MONITOR.lower():
+        raise PermissionError(
+            f"Refusing to {'enable' if enable else 'disable'} {instance_id}: "
+            "not a member of GUID_DEVCLASS_MONITOR"
+        )
 
     if enable:
         result = cfgmgr32.CM_Enable_DevNode(devinst, 0)
@@ -339,22 +786,65 @@ def _set_devnode_enabled(instance_id: str, enable: bool):
     )
 
 
+def _referenced_result_paths(pending_record) -> set:
+    """Every result-file path the given (already-loaded) pending_restore.json
+    record still treats as an unconsumed outcome.
+
+    Today's schema (see webview/bridge.py's `_build_and_save_pending_record`)
+    only ever stores this once, at the record level -- one elevated-helper
+    batch, one shared `result_file` covering every target in that batch.
+    Each target dict is checked too, purely defensively, in case a future
+    schema starts recording one per target; it costs nothing when absent.
+    """
+    paths = set()
+    if not isinstance(pending_record, dict):
+        return paths
+    candidates = [pending_record.get("result_file")]
+    targets = pending_record.get("targets")
+    if isinstance(targets, list):
+        for target in targets:
+            if isinstance(target, dict):
+                candidates.append(target.get("result_file"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            paths.add(os.path.normcase(os.path.abspath(candidate)))
+    return paths
+
+
 def _cleanup_stale_result_files(max_age_s: float = 300.0):
     """Best-effort sweep for orphaned monitor_op_result_*.json files.
 
-    A timed-out run_elevated_monitor_op() call returns before it can clean
+    A timed-out set_monitors_enabled() call returns before it can clean
     up its own result_path, because the elevated helper may still be
     running and write it moments later — deleting it immediately would race
     the helper's own write. Each call after that is a good opportunity to
     sweep anything old enough to be a genuine orphan, so these don't
     accumulate in APP_DIR indefinitely.
+
+    Age alone is not sufficient, though: the on-disk crash-recovery record
+    (pending_restore.json) can still be pointing at a result file that is
+    older than `max_age_s` simply because nothing has consumed it yet (no
+    live guard was armed, and the panel/app has not reopened to trigger
+    recheck_pending/recover_on_boot). Deleting that file out from under the
+    pending record would destroy the elevated helper's confirmed ok/message
+    before the recovery ladder ever reads it, degrading what should be a
+    clean confirmation or a descriptive failure into a weaker device-state
+    -- or liveness-only fallback. Any file still referenced by the current
+    pending record is therefore skipped regardless of age; only files with
+    no matching reference (or no pending record at all) are removed.
     """
     try:
+        referenced = _referenced_result_paths(load_pending())
         now = time.time()
         for name in os.listdir(APP_DIR):
-            if not (name.startswith("monitor_op_result_") and name.endswith(".json")):
+            if not (
+                name.startswith(recovery.RESULT_FILE_PREFIX)
+                and name.endswith(recovery.RESULT_FILE_SUFFIX)
+            ):
                 continue
             path = os.path.join(APP_DIR, name)
+            if os.path.normcase(os.path.abspath(path)) in referenced:
+                continue
             try:
                 if now - os.path.getmtime(path) > max_age_s:
                     os.remove(path)
@@ -364,126 +854,170 @@ def _cleanup_stale_result_files(max_age_s: float = 300.0):
         pass
 
 
-def run_elevated_monitor_op(op: str, instance_id: str, timeout_s: float = 30.0):
-    if not _SAFE_INSTANCE_ID_RE.match(instance_id):
-        return False, f"Refusing to process unexpected device id: {instance_id!r}"
-
-    _cleanup_stale_result_files()
-    result_path = os.path.join(
-        APP_DIR, f"monitor_op_result_{os.getpid()}_{int(time.time() * 1000)}.json"
-    )
-
-    if getattr(sys, "frozen", False):
-        target = sys.executable
-        params = f'--monitor-op {op} --instance-id "{instance_id}" --result-file "{result_path}"'
-    else:
-        target = sys.executable
-        script_path = os.path.abspath(sys.argv[0])
-        params = (
-            f'"{script_path}" --monitor-op {op} '
-            f'--instance-id "{instance_id}" --result-file "{result_path}"'
-        )
-
-    sei = SHELLEXECUTEINFOW()
-    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS
-    sei.hwnd = None
-    sei.lpVerb = "runas"
-    sei.lpFile = target
-    sei.lpParameters = params
-    sei.lpDirectory = None
-    sei.nShow = SW_HIDE
-
-    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
-        return False, "Elevation was cancelled or failed"
-
-    wait_result = kernel32.WaitForSingleObject(sei.hProcess, int(timeout_s * 1000))
-    if wait_result == WAIT_TIMEOUT:
-        kernel32.CloseHandle(sei.hProcess)
-        return False, TIMEOUT_MESSAGE
-    if wait_result != WAIT_OBJECT_0:
-        # A genuine wait error (e.g. WAIT_FAILED) is a confirmed, immediate
-        # failure — distinct from WAIT_TIMEOUT, which just means the process
-        # might still be running. Don't fold this into TIMEOUT_MESSAGE, or
-        # callers would wrongly treat a known failure as "unresolved, don't
-        # touch the recovery flag".
-        kernel32.CloseHandle(sei.hProcess)
-        return False, f"Elevated operation wait failed (code {wait_result})"
-
-    exit_code = wintypes.DWORD(0)
-    kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(exit_code))
-    kernel32.CloseHandle(sei.hProcess)
-
-    if not os.path.exists(result_path):
-        return False, "Elevated helper did not report a result"
-
-    try:
-        with open(result_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return False, "Elevated helper wrote an unreadable result"
-    finally:
-        try:
-            os.remove(result_path)
-        except Exception:
-            pass
-
-    return bool(data.get("ok", False)), data.get("message", "")
-
-
-def disable_monitor(instance_id: str):
-    return run_elevated_monitor_op("disable", instance_id)
-
-
-def enable_monitor(instance_id: str):
-    return run_elevated_monitor_op("enable", instance_id)
-
-
 def run_elevated_worker_op(op: str, instance_id: str):
     return _set_devnode_enabled(instance_id, enable=(op == "enable"))
 
 
 class PendingDisableGuard:
-    """Framework-agnostic 10s confirm-or-revert timer.
+    """10s auto-revert guard for a confirmed disable -- if the user takes no
+    action within the grace period, the disable is automatically undone.
 
-    `schedule_fn(delay_seconds, callback)` should return an opaque handle
-    (e.g. Tkinter's `.after()` id); `cancel_fn(handle)` should cancel it
-    (e.g. Tkinter's `.after_cancel()`). This lets it be unit tested with a
-    fake scheduler instead of a real Tk mainloop.
+    Pure `remaining_s(now)` / `is_expired(now)` core with an injectable
+    `now` -- no real `threading.Timer`/background thread lives inside this
+    class, so the countdown is unit-testable without real time passing. The
+    caller is responsible for polling `check(now)` (e.g. from a timer tick
+    or on panel reopen); on expiry it fires exactly ONE `revert_fn` call
+    covering every armed target, never one call per target, and reports the
+    true remaining time on reopen rather than a fresh 10 seconds.
     """
 
-    def __init__(self, revert_callback, schedule_fn, cancel_fn, timeout_seconds=10):
-        self._revert_callback = revert_callback
-        self._schedule_fn = schedule_fn
-        self._cancel_fn = cancel_fn
-        self._timeout_seconds = timeout_seconds
-        self._handle = None
-        self._confirmed = False
-        self._reverted = False
+    def __init__(self, *, armed_at: float, target_ids: list, revert_fn, timeout_s: float = 10.0):
+        self._armed_at = armed_at
+        self._target_ids = list(target_ids)
+        self._revert_fn = revert_fn
+        self._timeout_s = timeout_s
+        self._resolved = False
+        self._last_results = None
 
-    def start(self):
-        self._confirmed = False
-        self._reverted = False
-        self._handle = self._schedule_fn(self._timeout_seconds, self._on_timeout)
+    def remaining_s(self, now: float) -> float:
+        return max(0.0, self._timeout_s - (now - self._armed_at))
+
+    def is_expired(self, now: float) -> bool:
+        return (now - self._armed_at) >= self._timeout_s
 
     def confirm(self):
-        if self._reverted:
-            return
-        self._confirmed = True
-        if self._handle is not None:
-            self._cancel_fn(self._handle)
-            self._handle = None
+        """Mark this guard as kept/confirmed -- no future `check()` call
+        will revert."""
+        self._resolved = True
 
-    def _on_timeout(self):
-        if self._confirmed or self._reverted:
+    def check(self, now: float) -> bool:
+        """Poll-check the guard. If expired and not yet resolved (neither
+        confirmed nor already reverted), fires the single revert call for
+        every armed target. Returns True whenever this call actually
+        attempted a revert (i.e. it was expired and unresolved) --
+        regardless of whether that attempt genuinely succeeded. Callers
+        MUST NOT treat a True return as proof of success; read
+        `last_results`/`resolved` for the real outcome.
+
+        `resolved` is set only AFTER `revert_fn`
+        returns, not before. `revert_fn` is a real Win32/ctypes call chain
+        in production and can raise; if it does, this method lets the
+        exception propagate (the caller -- bridge.py's
+        `_resolve_guard_unbounded_under_lock`, via `config.call_logged` -- is what turns
+        it into a logged, non-fatal failure) and deliberately leaves the
+        guard unresolved, so a subsequent `check()` call retries the revert
+        instead of silently treating a failed revert as done.
+
+        "Didn't raise" is not the same as
+        "genuinely succeeded". The real production `revert_fn` (bridge.py's
+        lambda wrapping `monitors.set_monitors_enabled`) is deliberately
+        built to NEVER raise for expected failure modes -- it always
+        returns a `list[(instance_id, ok, message, kind)]` instead, exactly like
+        `set_monitors_enabled`'s own return shape, with `ok=False` entries
+        for a genuine per-target failure. A prior version of this method
+        marked itself `resolved=True` the moment `revert_fn` returned at
+        all, so a revert that failed for every single target (an entirely
+        normal, non-exceptional outcome for that function) was still
+        reported as "resolved" -- letting a caller clear the on-disk
+        crash-recovery record for a monitor that, in truth, is still
+        disabled.
+
+        `revert_fn`'s return value is captured on `last_results` every time
+        it is actually called (success or partial failure alike), and
+        `resolved` only flips to True once EVERY target id in
+        `self._target_ids` has a genuinely successful (`ok=True`) result.
+        A partial success (some targets revert, others don't) leaves the
+        guard unresolved, so a later poll retries the whole batch again
+        (re-reverting an already-enabled target is a harmless no-op). This
+        lets callers (bridge.py's `_resolve_guard_unbounded_under_lock`) trim only the
+        genuinely-succeeded targets out of the crash-recovery record instead
+        of assuming the whole batch resolved just because nothing raised.
+        """
+        if self._resolved:
+            return False
+        if not self.is_expired(now):
+            return False
+        results = self._revert_fn(self._target_ids)
+        self._last_results = results
+        succeeded_ids = {instance_id for instance_id, ok, _, _ in results if ok}
+        if succeeded_ids == set(self._target_ids):
+            self._resolved = True
+        return True
+
+    def rearm(self, now: float, delay_s: float) -> None:
+        """Reschedule this guard's own expiry window to `delay_s` seconds
+        from `now` -- the same real gap bridge.py's `_arm_guard_timer`
+        re-arms its `threading.Timer` for, whether that is the initial 10s
+        grace period or a later bounded backoff retry
+        (`_maybe_retry_auto_revert`'s `_AUTO_REVERT_RETRY_DELAY_S`).
+
+        Before this existed, `is_expired`/`check` compared `now` only
+        against `armed_at`/`timeout_s` as captured ONCE at `__init__` --
+        so once a guard passed its first deadline, `is_expired` stayed
+        permanently True for the rest of its life, no matter how far in
+        the future the real next scheduled retry actually was. Any caller
+        that resolves the guard between two scheduled attempts (a
+        `_resolve_guard_unbounded_under_lock` call with `source_timer=
+        None`, e.g. webview/app.py's window-close handler or
+        `confirm_update`'s background resolver -- neither is tied to a
+        specific timer instance, so neither is caught by the stale-timer
+        guard) would immediately re-fire a real revert attempt ahead of
+        schedule instead of waiting for the timer that is actually still
+        pending. Calling `rearm` in lockstep with every real timer
+        (re-)arm keeps `is_expired`'s notion of "expired" matching "the
+        next legitimate attempt is actually due", not just "has ever been
+        due once".
+
+        A no-op once the guard is already resolved (confirmed, fully
+        reverted, or emptied via `remove_targets`) -- a stray late rearm
+        racing a call that just resolved the guard must not reopen or
+        reschedule an already-frozen guard.
+        """
+        if self._resolved:
             return
-        self._reverted = True
-        self._revert_callback()
+        self._armed_at = now
+        self._timeout_s = delay_s
+
+    def remove_targets(self, target_ids):
+        """Partial-target resolution: drops `target_ids` from this guard's
+        tracked set WITHOUT calling `revert_fn` or fully resolving the
+        guard. Used when only SOME of a batch's targets get manually
+        re-enabled before the auto-revert timer fires (bridge.py's
+        `_resolve_guard_for_enabled_ids`) -- the guard/timer stay armed and
+        will still protect whatever targets remain when it later expires or
+        is next polled, instead of the whole guard being torn down on any
+        partial overlap.
+
+        `resolved` only flips to True once the tracked target set becomes
+        empty (every target has been accounted for, either reverted via
+        `check()` or removed here) -- the same "every target covered"
+        condition `check()` itself uses. A no-op once the guard is already
+        resolved, so a stray late call can't reopen or mutate a frozen
+        guard.
+        """
+        if self._resolved:
+            return
+        dropped = set(target_ids)
+        self._target_ids = [t for t in self._target_ids if t not in dropped]
+        if not self._target_ids:
+            self._resolved = True
 
     @property
-    def confirmed(self):
-        return self._confirmed
+    def target_ids(self):
+        return list(self._target_ids)
 
     @property
-    def reverted(self):
-        return self._reverted
+    def timeout_s(self):
+        return self._timeout_s
+
+    @property
+    def resolved(self):
+        return self._resolved
+
+    @property
+    def last_results(self):
+        """The `list[(instance_id, ok, message, kind)]` from the most recent
+        `check()` call that actually invoked `revert_fn`, or `None` if no
+        such call has happened yet (never expired, or the only attempt so
+        far raised before this could be set)."""
+        return list(self._last_results) if self._last_results is not None else None
