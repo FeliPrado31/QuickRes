@@ -248,3 +248,118 @@ def test_guarded_disable_auto_reverts_when_no_command_arrives(monkeypatch, tmp_p
     assert exit_code == 0
     assert calls == [("disable", "A"), ("enable", "A")]
     assert json.loads(completion_file.read_text(encoding="utf-8"))["action"] == "auto_revert"
+
+
+def test_guarded_disable_ignores_an_invalid_action_and_still_auto_reverts(monkeypatch, tmp_path):
+    # main.py's guard loop only treats "keep"/"revert" as actionable; any
+    # other value must be ignored (not mistaken for keep or revert) and the
+    # loop must keep polling until the deadline, landing on auto_revert --
+    # same timeout-forcing technique as
+    # test_guarded_disable_auto_reverts_when_no_command_arrives.
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "run_elevated_worker_op",
+        lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
+    )
+    monotonic_values = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    result_file = str(tmp_path / "monitor_op_result_111_230.json")
+    command_file = tmp_path / "monitor_guard_command_111_230.json"
+    completion_file = tmp_path / "monitor_guard_result_111_230.json"
+    command_file.write_text(json.dumps({"action": "nuke"}), encoding="utf-8")
+
+    exit_code = main._run_elevated_helper(
+        [
+            "--monitor-op", "guarded-disable",
+            "--instance-id", "A",
+            "--result-file", result_file,
+            "--guard-command-file", str(command_file),
+            "--guard-result-file", str(completion_file),
+            "--guard-timeout-s", "1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("disable", "A"), ("enable", "A")]
+    assert json.loads(completion_file.read_text(encoding="utf-8"))["action"] == "auto_revert"
+
+
+def test_guarded_disable_command_file_only_acts_on_the_launched_instance_id(monkeypatch, tmp_path):
+    # The guard loop reads only the "action" field from the command file and
+    # always applies it to the fixed args.instance_id list -- an extraneous
+    # "instance_id" in the command file naming a monitor the helper was never
+    # launched for must not be actionable. This locks in that guarantee: the
+    # command file can smuggle an out-of-scope instance_id but the helper
+    # only ever touches "A" (the one it was launched for), never "B".
+    calls = []
+
+    def worker(op, instance_id):
+        calls.append((op, instance_id))
+        return True, f"{op} {instance_id}"
+
+    monkeypatch.setattr(main, "run_elevated_worker_op", worker)
+    result_file = str(tmp_path / "monitor_op_result_111_231.json")
+    command_file = tmp_path / "monitor_guard_command_111_231.json"
+    completion_file = tmp_path / "monitor_guard_result_111_231.json"
+    command_file.write_text(
+        json.dumps({"action": "revert", "instance_id": "B"}), encoding="utf-8"
+    )
+
+    exit_code = main._run_elevated_helper(
+        [
+            "--monitor-op", "guarded-disable",
+            "--instance-id", "A",
+            "--result-file", result_file,
+            "--guard-command-file", str(command_file),
+            "--guard-result-file", str(completion_file),
+            "--guard-timeout-s", "1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("disable", "A"), ("enable", "A")]
+    assert all(instance_id != "B" for _op, instance_id in calls)
+    assert json.loads(completion_file.read_text(encoding="utf-8")) == {
+        "action": "revert",
+        "results": [{"instance_id": "A", "ok": True, "message": "enable A"}],
+    }
+
+
+def test_guarded_disable_malformed_command_file_does_not_crash_and_auto_reverts(
+    monkeypatch, tmp_path
+):
+    # An unparseable command file (truncated/garbage JSON) must be swallowed
+    # by the loop's (OSError, ValueError, json.JSONDecodeError) guard rather
+    # than propagating -- the loop keeps polling and falls through to the
+    # deadline's auto_revert fail-safe, same timeout-forcing technique as
+    # test_guarded_disable_auto_reverts_when_no_command_arrives.
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "run_elevated_worker_op",
+        lambda op, instance_id: calls.append((op, instance_id)) or (True, op),
+    )
+    monotonic_values = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    result_file = str(tmp_path / "monitor_op_result_111_232.json")
+    command_file = tmp_path / "monitor_guard_command_111_232.json"
+    completion_file = tmp_path / "monitor_guard_result_111_232.json"
+    command_file.write_text("{not valid json", encoding="utf-8")
+
+    exit_code = main._run_elevated_helper(
+        [
+            "--monitor-op", "guarded-disable",
+            "--instance-id", "A",
+            "--result-file", result_file,
+            "--guard-command-file", str(command_file),
+            "--guard-result-file", str(completion_file),
+            "--guard-timeout-s", "1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("disable", "A"), ("enable", "A")]
+    assert json.loads(completion_file.read_text(encoding="utf-8"))["action"] == "auto_revert"
