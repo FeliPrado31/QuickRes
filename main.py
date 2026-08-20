@@ -132,9 +132,16 @@ def _run_elevated_helper(argv) -> int:
         # mislabel a window that later settled into a different state.
         log_msg(f"Guard window expired without a valid keep/revert command (reason={last_reason}); auto-reverting")
 
-    completion = {"action": action, "results": []}
-    if action == "auto_revert":
-        completion["reason"] = last_reason
+    # "reason" is always present (None when it does not apply), matching
+    # the convention this codebase already uses for always-present
+    # classification fields (e.g. monitors.py OUTCOME_* as a required
+    # tuple element) rather than a key a caller could forget to guard
+    # with action == "auto_revert" before reading.
+    completion = {
+        "action": action,
+        "reason": last_reason if action == "auto_revert" else None,
+        "results": [],
+    }
     if action != "keep":
         for instance_id in args.instance_id:
             try:

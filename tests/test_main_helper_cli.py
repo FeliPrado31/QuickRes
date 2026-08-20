@@ -237,6 +237,7 @@ def test_guarded_disable_reuses_the_same_elevated_helper_for_revert(monkeypatch,
     assert calls == [("disable", "A"), ("enable", "A")]
     assert json.loads(completion_file.read_text(encoding="utf-8")) == {
         "action": "revert",
+        "reason": None,
         "results": [{"instance_id": "A", "ok": True, "message": "enable A"}],
     }
 
@@ -426,6 +427,7 @@ def test_guarded_disable_command_file_only_acts_on_the_launched_instance_id(monk
     assert calls == [("disable", "A"), ("enable", "A")]
     assert json.loads(completion_file.read_text(encoding="utf-8")) == {
         "action": "revert",
+        "reason": None,
         "results": [{"instance_id": "A", "ok": True, "message": "enable A"}],
     }
 
