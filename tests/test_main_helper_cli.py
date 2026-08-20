@@ -33,7 +33,17 @@ def _fake_worker_op(results_by_id):
     return worker
 
 
-def _guarded_disable_argv(tmp_path, suffix, *, timeout_s="1"):
+# _guarded_disable_argv's default and _force_deadline_after's mocked
+# time.monotonic() ceiling must agree on the same guard-timeout value --
+# main.py computes its real deadline from --guard-timeout-s, and a caller
+# that changed one without the other would make the mocked clock never
+# reach a timeout main.py is actually waiting for, hanging the guard loop
+# forever instead of failing with a clear assertion. One shared constant
+# instead of two independently-typed magic numbers closes that gap.
+_DEFAULT_GUARD_TIMEOUT_S = "1"
+
+
+def _guarded_disable_argv(tmp_path, suffix, *, timeout_s=_DEFAULT_GUARD_TIMEOUT_S):
     command_file = tmp_path / f"monitor_guard_command_111_{suffix}.json"
     completion_file = tmp_path / f"monitor_guard_result_111_{suffix}.json"
     argv = [
@@ -47,15 +57,18 @@ def _guarded_disable_argv(tmp_path, suffix, *, timeout_s="1"):
     return command_file, completion_file, argv
 
 
-def _force_deadline_after(monkeypatch, *poll_values):
+def _force_deadline_after(monkeypatch, *poll_values, guard_timeout_s=float(_DEFAULT_GUARD_TIMEOUT_S)):
     # Forces exactly len(poll_values) guard-loop iterations: the first
     # monotonic() call computes the deadline (0.0 + guard_timeout_s), each
     # of poll_values lets one while-condition check pass and its loop body
     # run, and monotonic() then keeps returning the timeout value forever
     # -- so a future extra monotonic() call per iteration fails the
     # deadline check (and the test's own assertions) instead of raising an
-    # opaque StopIteration.
-    guard_timeout_s = 1.0
+    # opaque StopIteration. guard_timeout_s must match whatever timeout_s
+    # was passed to _guarded_disable_argv for the same test, or the real
+    # while loop in main.py never sees its mocked clock cross the actual
+    # deadline and spins forever -- pass it explicitly if that test uses a
+    # non-default timeout_s.
     monotonic_values = itertools.chain(
         [0.0], poll_values, itertools.repeat(guard_timeout_s)
     )
