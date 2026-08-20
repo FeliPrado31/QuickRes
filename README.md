@@ -57,7 +57,7 @@ QuickRes uses [pywebview](https://pywebview.flowrl.com/) for its GUI (the panel 
 
 ```bash
 pip install -r requirements.txt
-python -m PyInstaller QuickRes.spec
+python -m PyInstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --add-data "quickres/webview;quickres/webview" --name QuickRes main.py
 ```
 
 `QuickRes.spec` bundles `quickres/webview/panel.html` and `quickres/webview/QuickRes.png` at the correct path for the frozen build and excludes Tkinter (unused since the GUI rewrite). The resulting single-file `dist/QuickRes.exe` is portable, no install needed.
