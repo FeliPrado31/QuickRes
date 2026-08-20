@@ -2,7 +2,6 @@
 <p align="center">
   <img src="QuickRes.png" width="140" alt="QuickRes">
 </p>
-if youve been false banned read https://sites.google.com/view/quickresonline/home
 
 A tiny Windows tool for instantly switching your resolution with one click.
 
@@ -58,7 +57,7 @@ QuickRes uses [pywebview](https://pywebview.flowrl.com/) for its GUI (the panel 
 
 ```bash
 pip install -r requirements.txt
-python -m PyInstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --add-data "quickres/webview;quickres/webview" --name QuickRes main.py
+python -m PyInstaller QuickRes.spec
 ```
 
 `QuickRes.spec` bundles `quickres/webview/panel.html` and `quickres/webview/QuickRes.png` at the correct path for the frozen build and excludes Tkinter (unused since the GUI rewrite). The resulting single-file `dist/QuickRes.exe` is portable, no install needed.
