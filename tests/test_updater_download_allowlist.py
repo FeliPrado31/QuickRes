@@ -176,6 +176,276 @@ class TestAllowlistRedirectHandler:
         assert result == "built-request"
 
 
+class TestProvenanceScopedCdnRedirectTrust:
+    """Round 25 finding: a real GitHub Releases redirect
+    (github.com/lxzydev/QuickRes/... -> objects.githubusercontent.com) was
+    being rejected by the unconditional _validate_download_url(newurl) check
+    in redirect_request, because the CDN host is intentionally NOT in
+    _DOWNLOAD_URL_ALLOWED_HOSTS (a server-supplied CDN host would defeat the
+    allowlist). Fix: _AllowlistRedirectHandler now takes the call's origin
+    URL at construction time and computes ONCE whether that origin (a)
+    already passed _validate_download_url AND (b) has hostname exactly
+    "github.com" -- which, combined with (a), implies the repo path prefix
+    also passed. Only when both hold, and only for the hardcoded CDN host
+    constant, is the redirect target's ordinary allowlist check skipped.
+    lxzy.my origins satisfy (a) but never (b), so they must never earn this
+    trust.
+    """
+
+    def _base_redirect_request_tracker(self, monkeypatch):
+        base_calls = []
+        monkeypatch.setattr(
+            updater.urllib.request.HTTPRedirectHandler,
+            "redirect_request",
+            lambda self, *a, **k: base_calls.append(1) or "built-request",
+        )
+        return base_calls
+
+    def test_repo_scoped_github_origin_redirect_to_cdn_reaches_base(
+        self, monkeypatch
+    ):
+        # Covers spec scenario "GitHub release URL redirects to CDN and
+        # succeeds".
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1.2.3/QuickRes.exe"
+        )
+        req = updater.urllib.request.Request(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1.2.3/QuickRes.exe"
+        )
+
+        result = handler.redirect_request(
+            req,
+            None,
+            302,
+            "Found",
+            {},
+            "https://objects.githubusercontent.com/release-assets/QuickRes.exe",
+        )
+
+        assert base_calls == [1]
+        assert result == "built-request"
+
+    def test_lxzy_my_origin_redirect_to_cdn_is_rejected(self, monkeypatch):
+        # Covers spec scenario "lxzy.my version-check redirecting to the
+        # GitHub CDN is rejected" -- passing _validate_download_url alone is
+        # NOT sufficient; the origin hostname must be exactly github.com.
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler("https://lxzy.my/version.json")
+        req = updater.urllib.request.Request("https://lxzy.my/version.json")
+
+        with pytest.raises(ValueError):
+            handler.redirect_request(
+                req,
+                None,
+                302,
+                "Found",
+                {},
+                "https://objects.githubusercontent.com/release-assets/QuickRes.exe",
+            )
+
+        assert base_calls == []
+
+    def test_out_of_repo_github_origin_redirect_to_cdn_is_rejected(
+        self, monkeypatch
+    ):
+        # Covers spec scenario "Different repo's GitHub URL redirecting to
+        # CDN stays rejected". Construction itself must not raise.
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler(
+            "https://github.com/attacker/evil-repo/releases/download/v1/QuickRes.exe"
+        )
+        req = updater.urllib.request.Request(
+            "https://github.com/attacker/evil-repo/releases/download/v1/QuickRes.exe"
+        )
+
+        with pytest.raises(ValueError):
+            handler.redirect_request(
+                req,
+                None,
+                302,
+                "Found",
+                {},
+                "https://objects.githubusercontent.com/release-assets/QuickRes.exe",
+            )
+
+        assert base_calls == []
+
+    def test_default_no_origin_redirect_to_cdn_is_rejected(self, monkeypatch):
+        # Fail-closed default: _AllowlistRedirectHandler() with no origin_url
+        # must never earn CDN-redirect trust.
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler()
+        req = updater.urllib.request.Request(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+
+        with pytest.raises(ValueError):
+            handler.redirect_request(
+                req,
+                None,
+                302,
+                "Found",
+                {},
+                "https://objects.githubusercontent.com/release-assets/QuickRes.exe",
+            )
+
+        assert base_calls == []
+
+    def test_repo_scoped_origin_redirect_to_non_https_cdn_host_is_rejected(
+        self, monkeypatch
+    ):
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+        req = updater.urllib.request.Request(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+
+        with pytest.raises(ValueError):
+            handler.redirect_request(
+                req,
+                None,
+                302,
+                "Found",
+                {},
+                "http://objects.githubusercontent.com/release-assets/QuickRes.exe",
+            )
+
+        assert base_calls == []
+
+    def test_repo_scoped_origin_redirect_to_lookalike_cdn_host_is_rejected(
+        self, monkeypatch
+    ):
+        # Exact hostname match only, never suffix matching.
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+        req = updater.urllib.request.Request(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+
+        with pytest.raises(ValueError):
+            handler.redirect_request(
+                req,
+                None,
+                302,
+                "Found",
+                {},
+                "https://objects.githubusercontent.com.evil.com/QuickRes.exe",
+            )
+
+        assert base_calls == []
+
+    def test_repo_scoped_origin_redirect_to_other_non_allowlisted_host_is_rejected(
+        self, monkeypatch
+    ):
+        # Provenance widens only the CDN, nothing else.
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+        req = updater.urllib.request.Request(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+
+        with pytest.raises(ValueError):
+            handler.redirect_request(
+                req,
+                None,
+                302,
+                "Found",
+                {},
+                "https://evil.example.com/QuickRes.exe",
+            )
+
+        assert base_calls == []
+
+    def test_two_handlers_with_different_origins_hold_independent_flags(
+        self, monkeypatch
+    ):
+        # Covers spec scenario "Provenance does not leak across calls" --
+        # no shared/module-level state.
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        trusted_handler = updater._AllowlistRedirectHandler(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+        untrusted_handler = updater._AllowlistRedirectHandler(
+            "https://lxzy.my/version.json"
+        )
+
+        req = updater.urllib.request.Request("https://lxzy.my/version.json")
+        with pytest.raises(ValueError):
+            untrusted_handler.redirect_request(
+                req,
+                None,
+                302,
+                "Found",
+                {},
+                "https://objects.githubusercontent.com/release-assets/QuickRes.exe",
+            )
+        assert base_calls == []
+
+        req2 = updater.urllib.request.Request(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+        result = trusted_handler.redirect_request(
+            req2,
+            None,
+            302,
+            "Found",
+            {},
+            "https://objects.githubusercontent.com/release-assets/QuickRes.exe",
+        )
+        assert base_calls == [1]
+        assert result == "built-request"
+
+    def test_chained_redirects_within_one_call_retain_provenance(
+        self, monkeypatch
+    ):
+        # Covers spec scenario "Chained redirects within one call retain
+        # correct provenance" -- more than one hop before reaching the CDN,
+        # all validated by the same handler instance.
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+
+        req = updater.urllib.request.Request(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+        # First hop: github.com -> github.com intermediate redirect page,
+        # still allowlisted (not the CDN), must reach base normally.
+        result1 = handler.redirect_request(
+            req,
+            None,
+            302,
+            "Found",
+            {},
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/asset-redirect",
+        )
+        assert base_calls == [1]
+        assert result1 == "built-request"
+
+        # Second hop: same handler instance, now redirecting to the CDN --
+        # provenance from the original origin must still apply.
+        req2 = updater.urllib.request.Request(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/asset-redirect"
+        )
+        result2 = handler.redirect_request(
+            req2,
+            None,
+            302,
+            "Found",
+            {},
+            "https://objects.githubusercontent.com/release-assets/QuickRes.exe",
+        )
+        assert base_calls == [1, 1]
+        assert result2 == "built-request"
+
+
 class TestApplyUpdateUsesRedirectValidatingOpener:
     def test_apply_update_installs_allowlist_redirect_handler(
         self, monkeypatch, tmp_path

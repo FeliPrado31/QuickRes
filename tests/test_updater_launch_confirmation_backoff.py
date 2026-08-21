@@ -88,6 +88,32 @@ class TestLaunchHealthCheck:
         assert "timeout /t 1 /nobreak >nul" in section
         assert "goto :launchtry" in section
 
+    def test_settles_before_first_launch_attempt_to_avoid_a_racy_false_confirm(
+        self, monkeypatch, tmp_path
+    ):
+        """Round 27 finding: `move /y` (or the `:restore` rename) can hand
+        control back before the OS/antivirus have fully released the
+        just-written exe -- `Start-Process` can then launch a process that
+        immediately shows a native loader error (e.g. "Failed to load
+        Python DLL ... LoadLibrary") while technically staying "alive" (a
+        blocking MessageBox), fooling the 2-second health check into
+        reporting `:confirmed` on a build that never actually started. A
+        short settle delay right at `:launch`, before the FIRST
+        `Start-Process` attempt, narrows this window the same way the
+        existing renwait/reverify steps narrow their own races -- must sit
+        strictly between `:launch` and `set LAUNCHRETRIES=0`, not just the
+        retry loop's own existing between-attempts timeout.
+        """
+        script = _generated_script(monkeypatch, tmp_path)
+        section = _launch_section(script)
+        stripped = [line.strip().lower() for line in section]
+        launch_idx = stripped.index(":launch")
+        retries_idx = stripped.index("set launchretries=0")
+
+        before_first_attempt = stripped[launch_idx + 1 : retries_idx]
+
+        assert "timeout /t 1 /nobreak >nul" in before_first_attempt
+
     def test_escapes_executable_and_working_directory_for_powershell(self):
         malicious = r"C:\Users\evil' ; Remove-Item C:\ -Recurse -Force #\QuickRes.exe"
         command = updater._build_launch_healthcheck_command(malicious)

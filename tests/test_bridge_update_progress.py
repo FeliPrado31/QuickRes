@@ -57,14 +57,22 @@ def test_install_verified_update_uses_safety_handoff_and_existing_rollback_path(
     events = []
     monkeypatch.setattr(api, "_prepare_update_handoff_locked", lambda: events.append("handoff"))
 
-    def fake_apply_update(url, version_info=None, **kwargs):
+    # install_downloaded_update() must route through updater's own
+    # force-exit wrapper (not call apply_update directly) -- a plain
+    # SystemExit from apply_update(reuse_download=True) only kills the
+    # pywebview worker thread it runs on, not the whole process, so the
+    # original window never actually closes. See test_updater_exit_behavior.py
+    # for the os._exit(0) coverage; this test only checks the bridge wires
+    # the call through correctly.
+    def fake_install_downloaded_update(version_info=None):
         events.append("apply")
-        assert url is None
         assert version_info == {"version": "2.0"}
-        assert kwargs == {"reuse_download": True}
         return {"started": True}
 
-    monkeypatch.setattr("quickres.webview.bridge.updater.apply_update", fake_apply_update)
+    monkeypatch.setattr(
+        "quickres.webview.bridge.updater.install_downloaded_update",
+        fake_install_downloaded_update,
+    )
 
     result = api.install_downloaded_update()
 

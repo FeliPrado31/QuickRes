@@ -80,6 +80,37 @@ class TestUpdateAvailable:
         assert updater.update_available("1.0.7", "not a dict") is False
 
 
+class TestResolveDownloadUrl:
+    def test_download_url_field_is_used_when_present(self):
+        assert (
+            updater.resolve_download_url({"download_url": "https://lxzy.my/QuickRes.exe"})
+            == "https://lxzy.my/QuickRes.exe"
+        )
+
+    def test_falls_back_to_url_field(self):
+        # The live version.json response actually names the field "url",
+        # not "download_url" -- this is the real current server shape.
+        assert (
+            updater.resolve_download_url({"version": "1.2.0", "url": "https://lxzy.my/QuickRes.exe"})
+            == "https://lxzy.my/QuickRes.exe"
+        )
+
+    def test_download_url_field_takes_precedence_over_url(self):
+        assert (
+            updater.resolve_download_url(
+                {"download_url": "https://lxzy.my/a.exe", "url": "https://lxzy.my/b.exe"}
+            )
+            == "https://lxzy.my/a.exe"
+        )
+
+    def test_missing_both_fields_returns_none(self):
+        assert updater.resolve_download_url({"version": "1.2.0"}) is None
+
+    def test_non_dict_returns_none(self):
+        assert updater.resolve_download_url(None) is None
+        assert updater.resolve_download_url("not a dict") is None
+
+
 class TestBridgeCheckUpdatesReportsUpdateAvailable:
     def _frozen_api(self, monkeypatch):
         monkeypatch.setattr("quickres.webview.bridge.sys.frozen", True, raising=False)
@@ -125,6 +156,23 @@ class TestBridgeCheckUpdatesReportsUpdateAvailable:
 
         assert result["ok"] is True
         assert result["data"]["update_available"] is False
+
+    def test_real_server_url_field_is_exposed_as_download_url(self, monkeypatch):
+        # The live version.json response actually names the field "url", not
+        # "download_url" -- panel.html reads S.updateInfo.download_url, so
+        # without this normalization the "Update Now" button silently no-ops.
+        api = self._frozen_api(monkeypatch)
+        monkeypatch.setattr(
+            "quickres.webview.bridge.updater.fetch_version_info",
+            lambda: {"version": "99.0.0", "url": "https://lxzy.my/QuickRes.exe"},
+        )
+
+        result = api.check_updates()
+
+        assert result["ok"] is True
+        assert result["data"]["download_url"] == "https://lxzy.my/QuickRes.exe"
+        # Raw field is preserved alongside the normalized one.
+        assert result["data"]["url"] == "https://lxzy.my/QuickRes.exe"
 
     def test_not_frozen_still_returns_none_without_fetching(self, monkeypatch):
         monkeypatch.setattr("quickres.webview.bridge.sys.frozen", False, raising=False)

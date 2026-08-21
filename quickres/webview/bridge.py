@@ -850,7 +850,11 @@ class Api:
         # stream (panel.html) can render a real dialog only when warranted,
         # instead of on every successful fetch regardless of version.
         info = updater.fetch_version_info()
-        return {**info, "update_available": updater.update_available(__version__, info)}
+        result = {**info, "update_available": updater.update_available(__version__, info)}
+        download_url = updater.resolve_download_url(info)
+        if download_url is not None:
+            result["download_url"] = download_url
+        return result
 
     def _prepare_update_handoff_locked(self):
         """Best-effort safety hand-off before an update exits this process.
@@ -1011,11 +1015,7 @@ class Api:
         if job is None or job.snapshot().get("stage") != "ready":
             raise RuntimeError("No verified update is ready to install")
         self._prepare_update_handoff_locked()
-        return updater.apply_update(
-            None,
-            version_info=job.version_info,
-            reuse_download=True,
-        )
+        return updater.install_downloaded_update(version_info=job.version_info)
 
     @bridge_op()
     def list_monitors(self):
