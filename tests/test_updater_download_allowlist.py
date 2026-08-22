@@ -50,6 +50,29 @@ class TestValidateDownloadUrl:
         with pytest.raises(ValueError):
             updater._validate_download_url("https://github.com/QuickRes.exe")
 
+    def test_rejects_path_traversal_that_escapes_repo_scope(self):
+        # Round 28 finding: the prefix check compared the RAW,
+        # unnormalized path string, so a URL containing enough `../`
+        # segments to actually escape the repo scope after normalization
+        # (e.g. by a server that normalizes dot-segments before routing,
+        # standard RFC 3986 behavior) still passed because the raw string
+        # literally starts with "/lxzydev/QuickRes/". Confirmed via
+        # posixpath.normpath: this exact path normalizes to
+        # "/lxzydev/attacker-org/evil-repo/x", outside the repo.
+        with pytest.raises(ValueError):
+            updater._validate_download_url(
+                "https://github.com/lxzydev/QuickRes/releases/download/v1/"
+                "../../../../attacker-org/evil-repo/x"
+            )
+
+    def test_accepts_dot_segments_that_stay_within_repo_scope(self):
+        # A `../` that normalizes back to somewhere still under
+        # /lxzydev/QuickRes/ must not be rejected just for containing dots.
+        updater._validate_download_url(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/"
+            "../../../attacker-org/evil-repo/x"
+        )
+
 
 class TestApplyUpdateEnforcesAllowlistBeforeDownload:
     def test_rejects_non_https_scheme_before_urlopen(self, monkeypatch):
@@ -524,3 +547,59 @@ class TestApplyUpdateUsesRedirectValidatingOpener:
             isinstance(h, updater._AllowlistRedirectHandler)
             for h in build_opener_calls[0]
         )
+
+    def test_apply_update_wires_download_url_as_handler_origin(
+        self, monkeypatch, tmp_path
+    ):
+        # Round 28 finding: the isinstance-only check above cannot tell
+        # apart a correctly-wired `_AllowlistRedirectHandler(download_url)`
+        # from a regressed bare `_AllowlistRedirectHandler()` -- both are
+        # still instances of the same class. A repo-scoped github.com
+        # download_url must produce a handler whose own provenance flag is
+        # actually True, proving the origin was really threaded through
+        # (a bare-constructed handler would read False here instead).
+        fake_exe = tmp_path / "QuickRes.exe"
+        fake_exe.write_bytes(b"old")
+        monkeypatch.setattr(updater.sys, "executable", str(fake_exe))
+
+        header = bytearray(64)
+        header[0:2] = b"MZ"
+        header[60:64] = (64).to_bytes(4, "little")
+        valid_payload = bytes(header) + b"PE\x00\x00" + b"restofheader"
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return valid_payload
+
+        build_opener_calls = []
+
+        class _FakeOpener:
+            def open(self, request, timeout=None):
+                return _FakeResp()
+
+        def _fake_build_opener(*handlers):
+            build_opener_calls.append(handlers)
+            return _FakeOpener()
+
+        monkeypatch.setattr(
+            updater.urllib.request, "build_opener", _fake_build_opener
+        )
+        monkeypatch.setattr(updater.subprocess, "Popen", lambda *a, **k: None)
+
+        with pytest.raises(SystemExit):
+            updater.apply_update(
+                "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+            )
+
+        handler = next(
+            h
+            for h in build_opener_calls[0]
+            if isinstance(h, updater._AllowlistRedirectHandler)
+        )
+        assert handler._release_cdn_trusted is True

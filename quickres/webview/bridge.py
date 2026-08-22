@@ -420,6 +420,7 @@ def bridge_op(*, lock: bool = False, boot_armed_bypass: bool = False, releases_b
                 # before `except Exception` for clarity, though order
                 # doesn't matter for catching: SystemExit is a
                 # BaseException, never caught by `except Exception`.
+                log_msg(f"{fn.__name__} raised SystemExit; force-exiting.")
                 os._exit(0)
             except Exception as exc:
                 log_msg(f"{fn.__name__} failed: {exc!r}\n{traceback.format_exc()}")
@@ -862,16 +863,20 @@ class Api:
         # stream (panel.html) can render a real dialog only when warranted,
         # instead of on every successful fetch regardless of version.
         info = updater.fetch_version_info()
-        result = {**info, "update_available": updater.update_available(__version__, info)}
-        # Always OVERWRITE (never conditionally set) -- {**info} above may
-        # already have copied a raw, malformed "download_url" straight
-        # from the server response (e.g. a non-string value). Only setting
-        # this key when resolve_download_url() succeeds would leave that
-        # raw value in place on failure instead of the intended fail-closed
-        # None, letting a bad value slip past panel.html's truthiness check
-        # and crash deep inside apply_update() with a confusing error.
-        result["download_url"] = updater.resolve_download_url(info)
-        return result
+        # "download_url" is set in THIS SAME literal (not a separate
+        # statement after) so the resolved value structurally always wins
+        # over whatever {**info} would have copied for that key -- {**info}
+        # may include a raw, malformed "download_url" straight from the
+        # server response (e.g. a non-string value), and a later, separate
+        # assignment could too easily be "improved" into a conditional
+        # (e.g. only set when non-None) that would let that raw value leak
+        # through to panel.html's truthiness check and crash deep inside
+        # apply_update() with a confusing error.
+        return {
+            **info,
+            "update_available": updater.update_available(__version__, info),
+            "download_url": updater.resolve_download_url(info),
+        }
 
     def _prepare_update_handoff_locked(self):
         """Best-effort safety hand-off before an update exits this process.
@@ -900,9 +905,10 @@ class Api:
         # handling every other lock=True method gets), so no UI change is
         # needed.
         #
-        # updater.confirm_update can force-kill this process with
-        # os._exit(0) (inside apply_update, once the download is verified
-        # and staged) -- os._exit skips normal interpreter shutdown, so
+        # Both updater.confirm_update AND updater.install_downloaded_update
+        # can force-kill this process with os._exit(0) (once the download
+        # is verified and staged) -- os._exit skips normal interpreter
+        # shutdown, so
         # webview/app.py's window "closing" event, and therefore its
         # _on_closing handler, never runs. _on_closing is the only other
         # place that gives a still-armed 10s auto-revert guard

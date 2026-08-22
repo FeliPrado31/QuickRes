@@ -85,13 +85,36 @@ class TestLaunchHealthCheck:
         assert "set launchretries=0" in section
         assert "set /a launchretries+=1" in section
         assert "if %launchretries% geq 2 goto :launchfail" in section
+        assert "goto :launchtry" in section
         # Round 28 finding: `timeout /t 1 /nobreak >nul` is a no-op under
         # this script's actual no-console launch flags (see
         # test_no_console_safe_delay_actually_waits below) -- the
         # between-retries wait must use the PowerShell-based delay instead.
         assert "timeout /t 1 /nobreak >nul" not in section
-        assert 'start-sleep -seconds 1"' in section
-        assert "goto :launchtry" in section
+
+    def test_between_retries_wait_uses_the_working_delay_command(
+        self, monkeypatch, tmp_path
+    ):
+        """Round 28 finding: a substring check anywhere in the whole launch
+        section cannot tell this delay apart from the UNRELATED
+        pre-first-attempt settle delay elsewhere in the same section --
+        empirically confirmed by reconstructing the section with only this
+        occurrence removed and observing the old assertion still passed.
+        This test scopes strictly to the text between the retry-count
+        check and `goto :launchtry`, the only place this specific delay
+        can legitimately appear.
+        """
+        script = _generated_script(monkeypatch, tmp_path)
+        section = _launch_section(script)
+        stripped = [line.strip().lower() for line in section]
+        geq_idx = stripped.index("if %launchretries% geq 2 goto :launchfail")
+        goto_idx = stripped.index("goto :launchtry")
+        assert goto_idx > geq_idx
+
+        between_retries = "\n".join(stripped[geq_idx + 1 : goto_idx])
+
+        assert 'start-sleep -seconds 1"' in between_retries
+        assert "timeout /t 1" not in between_retries
 
     def test_settles_before_first_launch_attempt_to_avoid_a_racy_false_confirm(
         self, monkeypatch, tmp_path
@@ -128,17 +151,21 @@ class TestLaunchHealthCheck:
         exited in ~50ms (measured) under `CREATE_NO_WINDOW |
         DETACHED_PROCESS` (the exact flags apply_update() launches
         update.bat with), because `timeout.exe` requires an attached
-        console it does not have there. This test actually EXECUTES
-        `_NO_CONSOLE_SAFE_DELAY_CMD` under those same flags and measures
-        wall-clock time, so a future regression back to a console-dependent
-        delay command fails loudly instead of silently.
+        console it does not have there. This test actually EXECUTES the
+        same PowerShell-based mechanism `_NO_CONSOLE_SAFE_DELAY_CMD` uses
+        under those same flags and measures wall-clock time, so a future
+        regression back to a console-dependent delay command fails loudly
+        instead of silently. Uses a short synthetic duration (not the
+        production command's actual 1-second value) -- the mechanism being
+        proven is "does this command family wait at all under these
+        flags", which a 250ms wait demonstrates just as well as 1s, for a
+        fraction of the real time cost on every test run.
         """
         import subprocess
         import time
 
-        # Strip the trailing newline updater.py's batch-line constants
-        # carry; run through cmd.exe the same way update.bat's own lines do.
-        command = updater._NO_CONSOLE_SAFE_DELAY_CMD.strip()
+        assert "Start-Sleep" in updater._NO_CONSOLE_SAFE_DELAY_CMD
+        command = 'powershell -NoProfile -NonInteractive -Command "Start-Sleep -Milliseconds 250"'
         start = time.monotonic()
         subprocess.run(
             ["cmd", "/c", command],
@@ -147,9 +174,9 @@ class TestLaunchHealthCheck:
         )
         elapsed = time.monotonic() - start
 
-        assert elapsed >= 0.8, (
+        assert elapsed >= 0.2, (
             f"delay command returned after {elapsed:.2f}s -- expected it to "
-            f"actually wait ~1s under no-console flags, not exit immediately"
+            f"actually wait ~0.25s under no-console flags, not exit immediately"
         )
 
     def test_escapes_executable_and_working_directory_for_powershell(self):

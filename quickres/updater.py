@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -50,7 +51,18 @@ def _validate_download_url(url: str) -> None:
     if not _has_https_scheme_and_allowed_host(url, _DOWNLOAD_URL_ALLOWED_HOSTS):
         raise ValueError(f"Refusing to download update from non-allowlisted URL: {url!r}")
     parsed = urllib.parse.urlsplit(url)
-    if parsed.hostname == "github.com" and not parsed.path.startswith(
+    # Round 28 finding: comparing the RAW, unnormalized path let a URL
+    # containing enough `../` segments to actually escape the repo scope
+    # after normalization (standard RFC 3986 behavior for most HTTP
+    # servers/CDNs, including how GitHub's own edge is expected to route)
+    # still pass, since the raw string can literally start with
+    # "/lxzydev/QuickRes/" while normalizing to somewhere else entirely.
+    # posixpath.normpath collapses `..`/`.` segments the same way; this
+    # module's new CDN-redirect-trust mechanism (_origin_permits_release_cdn)
+    # builds its trust decision on this exact check passing, so a bypass
+    # here would also earn undeserved CDN-redirect trust.
+    normalized_path = posixpath.normpath(parsed.path)
+    if parsed.hostname == "github.com" and not normalized_path.startswith(
         _GITHUB_REPO_PATH_PREFIX
     ):
         raise ValueError(
@@ -144,11 +156,23 @@ class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
         # calling a bool instead of the function.
         self._release_cdn_trusted = _origin_permits_release_cdn(origin_url)
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        preceding_hop_trusted = self._release_cdn_trusted and _origin_permits_release_cdn(
-            req.full_url
+    def _redirect_skips_standard_validation(self, req, newurl) -> bool:
+        """True only when ALL THREE hold: (1) this handler's own
+        construction-time origin earned CDN trust, (2) the request that
+        just received THIS redirect (`req.full_url`, the immediately
+        preceding hop) independently earns it too, and (3) the redirect
+        target is actually one of the trusted CDN hosts. Named for what it
+        returns (may `_validate_download_url` be skipped for `newurl`),
+        not for any one of the three conditions alone.
+        """
+        return (
+            self._release_cdn_trusted
+            and _origin_permits_release_cdn(req.full_url)
+            and _is_release_cdn_url(newurl)
         )
-        if not (preceding_hop_trusted and _is_release_cdn_url(newurl)):
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not self._redirect_skips_standard_validation(req, newurl):
             _validate_download_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -901,7 +925,11 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
         "if not errorlevel 1 goto :renamed\n"
         "set /a RETRIES+=1\n"
         "if %RETRIES% GEQ 5 goto :renfail\n"
-        "timeout /t 1 /nobreak >nul\n"
+        # Round 28 finding: this was `timeout /t 1 /nobreak >nul` -- a
+        # no-op under this script's actual no-console launch flags, the
+        # same bug the launch-retry delays elsewhere in this script were
+        # fixed for. See `_NO_CONSOLE_SAFE_DELAY_CMD`.
+        f"{_NO_CONSOLE_SAFE_DELAY_CMD}"
         "goto :renwait\n"
         ":renfail\n"
         'echo %DATE% %TIME% update.bat: rename failed after retries, restoring >>"%QR_LOG%"\n'
@@ -1050,12 +1078,21 @@ def _force_exit_on_expected_system_exit(run) -> None:
     `os._exit(0)` skips Python's normal interpreter shutdown/atexit
     handlers -- safe and desired here: the exe on disk has just been
     renamed out from under the running process, so a normal clean shutdown
-    path could still try to touch it. It is also the only way to
-    guarantee the WHOLE process exits when `run()` is invoked from a
-    pywebview JS-bridge call: pywebview dispatches `js_api` calls off the
-    main thread, and a plain `SystemExit` raised there only terminates
-    that ONE worker thread, not the process -- exactly the bug
-    `install_downloaded_update` closes (see its own docstring).
+    path could still try to touch it. It also guarantees the WHOLE
+    process exits when `run()` is invoked from a pywebview JS-bridge call:
+    pywebview dispatches `js_api` calls off the main thread, and a plain
+    `SystemExit` raised there only terminates that ONE worker thread, not
+    the process -- exactly the bug `install_downloaded_update` closes (see
+    its own docstring). `webview/bridge.py`'s `bridge_op` decorator ALSO
+    force-exits on `SystemExit` as a structural backstop for every wrapped
+    `Api` method, including these two -- so for the actual production call
+    paths (both go through `bridge_op`), this wrapper's own `os._exit(0)`
+    is redundant with that backstop, not the only thing standing between a
+    stray `SystemExit` and a hung window. Deliberate belt-and-suspenders,
+    matching this module's existing TOCTOU-reverify philosophy elsewhere:
+    kept here anyway so `confirm_update`/`install_downloaded_update` are
+    each independently correct even if ever called from somewhere that
+    ISN'T `bridge_op`-wrapped.
 
     Any OTHER exception (network failure, disk-full, etc.) is NOT
     force-exited -- it propagates normally so `bridge_op` (or, for the
@@ -1065,6 +1102,7 @@ def _force_exit_on_expected_system_exit(run) -> None:
     try:
         run()
     except SystemExit:
+        log_msg("Update staged successfully; force-exiting to complete install.")
         os._exit(0)
 
 

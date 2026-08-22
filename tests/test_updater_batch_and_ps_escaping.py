@@ -89,8 +89,14 @@ class TestReverifyCommandEscapesSingleQuote:
         evil_dir = tmp_path / "evil' -and $true -or 'x"
         script = _generated_script(monkeypatch, evil_dir)
 
+        # Round 28 finding: the generated script now has multiple
+        # "powershell"-starting lines (the settle/retry delays also use
+        # PowerShell) -- target the reverify command specifically by its
+        # own unique signature, not just the first powershell line.
         ps_line = next(
-            l for l in script.splitlines() if l.strip().lower().startswith("powershell")
+            l
+            for l in script.splitlines()
+            if l.strip().lower().startswith("powershell") and "readallbytes" in l.lower()
         )
         assert "evil'' -and $true -or ''x" in ps_line
         assert "evil' -and" not in ps_line
