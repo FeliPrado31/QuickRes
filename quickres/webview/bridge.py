@@ -409,6 +409,18 @@ def bridge_op(*, lock: bool = False, boot_armed_bypass: bool = False, releases_b
                 # and still no-ops for a boot_armed_bypass call that never
                 # acquired one to begin with.
                 return {"ok": False, "kind": "busy", "data": None, "message": str(exc)}
+            except SystemExit:
+                # Round 28 finding: a structural backstop, not just relying
+                # on individual call sites (updater.confirm_update /
+                # updater.install_downloaded_update already wrap
+                # themselves) to remember this. A plain SystemExit raised
+                # here only kills the pywebview worker thread this method
+                # runs on, not the whole process, leaving the window hung
+                # forever -- os._exit(0) is what actually closes it. Placed
+                # before `except Exception` for clarity, though order
+                # doesn't matter for catching: SystemExit is a
+                # BaseException, never caught by `except Exception`.
+                os._exit(0)
             except Exception as exc:
                 log_msg(f"{fn.__name__} failed: {exc!r}\n{traceback.format_exc()}")
                 return {"ok": False, "kind": "error", "data": None,
@@ -851,9 +863,14 @@ class Api:
         # instead of on every successful fetch regardless of version.
         info = updater.fetch_version_info()
         result = {**info, "update_available": updater.update_available(__version__, info)}
-        download_url = updater.resolve_download_url(info)
-        if download_url is not None:
-            result["download_url"] = download_url
+        # Always OVERWRITE (never conditionally set) -- {**info} above may
+        # already have copied a raw, malformed "download_url" straight
+        # from the server response (e.g. a non-string value). Only setting
+        # this key when resolve_download_url() succeeds would leave that
+        # raw value in place on failure instead of the intended fail-closed
+        # None, letting a bad value slip past panel.html's truthiness check
+        # and crash deep inside apply_update() with a confusing error.
+        result["download_url"] = updater.resolve_download_url(info)
         return result
 
     def _prepare_update_handoff_locked(self):

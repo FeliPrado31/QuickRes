@@ -85,7 +85,12 @@ class TestLaunchHealthCheck:
         assert "set launchretries=0" in section
         assert "set /a launchretries+=1" in section
         assert "if %launchretries% geq 2 goto :launchfail" in section
-        assert "timeout /t 1 /nobreak >nul" in section
+        # Round 28 finding: `timeout /t 1 /nobreak >nul` is a no-op under
+        # this script's actual no-console launch flags (see
+        # test_no_console_safe_delay_actually_waits below) -- the
+        # between-retries wait must use the PowerShell-based delay instead.
+        assert "timeout /t 1 /nobreak >nul" not in section
+        assert 'start-sleep -seconds 1"' in section
         assert "goto :launchtry" in section
 
     def test_settles_before_first_launch_attempt_to_avoid_a_racy_false_confirm(
@@ -112,7 +117,40 @@ class TestLaunchHealthCheck:
 
         before_first_attempt = stripped[launch_idx + 1 : retries_idx]
 
-        assert "timeout /t 1 /nobreak >nul" in before_first_attempt
+        # Round 28 finding: `timeout` is a no-op under this script's actual
+        # no-console launch flags -- see test_no_console_safe_delay_actually_waits.
+        assert 'start-sleep -seconds 1"' in "\n".join(before_first_attempt)
+
+    def test_no_console_safe_delay_actually_waits(self):
+        """Round 28 finding: the string-only assertions above cannot catch a
+        delay command that generates valid-looking text but does not
+        actually wait -- `timeout /t 1 /nobreak >nul` looked correct yet
+        exited in ~50ms (measured) under `CREATE_NO_WINDOW |
+        DETACHED_PROCESS` (the exact flags apply_update() launches
+        update.bat with), because `timeout.exe` requires an attached
+        console it does not have there. This test actually EXECUTES
+        `_NO_CONSOLE_SAFE_DELAY_CMD` under those same flags and measures
+        wall-clock time, so a future regression back to a console-dependent
+        delay command fails loudly instead of silently.
+        """
+        import subprocess
+        import time
+
+        # Strip the trailing newline updater.py's batch-line constants
+        # carry; run through cmd.exe the same way update.bat's own lines do.
+        command = updater._NO_CONSOLE_SAFE_DELAY_CMD.strip()
+        start = time.monotonic()
+        subprocess.run(
+            ["cmd", "/c", command],
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            check=True,
+        )
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= 0.8, (
+            f"delay command returned after {elapsed:.2f}s -- expected it to "
+            f"actually wait ~1s under no-console flags, not exit immediately"
+        )
 
     def test_escapes_executable_and_working_directory_for_powershell(self):
         malicious = r"C:\Users\evil' ; Remove-Item C:\ -Recurse -Force #\QuickRes.exe"

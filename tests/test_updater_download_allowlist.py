@@ -445,6 +445,37 @@ class TestProvenanceScopedCdnRedirectTrust:
         assert base_calls == [1, 1]
         assert result2 == "built-request"
 
+    def test_intermediate_non_github_hop_revokes_cdn_trust(self, monkeypatch):
+        # Round 28 finding: `_release_cdn_trusted` was computed ONCE at
+        # construction from the caller-supplied origin_url and never
+        # re-checked per hop, so a chain that starts at a trusted
+        # github.com origin but routes through an intermediate
+        # non-github.com hop (e.g. lxzy.my) before reaching the CDN kept
+        # its ORIGINAL trust -- even though the immediately-preceding hop
+        # was not itself a repo-scoped github.com URL. Trust must be
+        # re-derived from the actual immediately-preceding request
+        # (`req.full_url`) on every hop, not just inherited from
+        # construction.
+        base_calls = self._base_redirect_request_tracker(monkeypatch)
+        handler = updater._AllowlistRedirectHandler(
+            "https://github.com/lxzydev/QuickRes/releases/download/v1/QuickRes.exe"
+        )
+        req_intermediate = updater.urllib.request.Request(
+            "https://lxzy.my/some/unrelated/path"
+        )
+
+        with pytest.raises(ValueError):
+            handler.redirect_request(
+                req_intermediate,
+                None,
+                302,
+                "Found",
+                {},
+                "https://objects.githubusercontent.com/release-assets/QuickRes.exe",
+            )
+
+        assert base_calls == []
+
 
 class TestApplyUpdateUsesRedirectValidatingOpener:
     def test_apply_update_installs_allowlist_redirect_handler(

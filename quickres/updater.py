@@ -115,12 +115,24 @@ class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
     refused pre-flight rather than merely detected post-hoc.
 
     `origin_url` is the caller's own already-known request URL for this one
-    call (see `fetch_version_info`/`apply_update`). Whether that origin
+    call (see `fetch_version_info`/`apply_update`). Whether THAT origin
     earns CDN-redirect trust is computed ONCE here, at construction time,
     and held only as per-instance state -- never module-level or otherwise
-    shared across calls -- so it cannot drift mid-chain or leak between
-    unrelated requests. Defaulting to `None` fails closed (no provenance)
-    and keeps direct no-arg construction (as in existing tests) unchanged.
+    shared across calls -- so it cannot leak between unrelated requests.
+    Defaulting to `None` fails closed (no provenance) and keeps direct
+    no-arg construction (as in existing tests) unchanged.
+
+    Round 28 finding: that construction-time flag alone is NOT sufficient
+    for a multi-hop redirect chain -- `redirect_request` also re-checks
+    `req.full_url` (the URL of the request that just received THIS
+    specific redirect, i.e. the immediately-preceding hop) on every call,
+    and only grants CDN trust when BOTH the original construction-time
+    origin AND the immediately-preceding hop independently qualify.
+    Without this, a chain that starts at a trusted github.com origin but
+    is redirected through an intermediate non-github.com hop (e.g.
+    lxzy.my) before reaching the CDN would keep the ORIGINAL trust even
+    though the hop that actually preceded the CDN redirect was never
+    itself a repo-scoped github.com URL.
     """
 
     def __init__(self, origin_url=None):
@@ -133,7 +145,10 @@ class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
         self._release_cdn_trusted = _origin_permits_release_cdn(origin_url)
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not (self._release_cdn_trusted and _is_release_cdn_url(newurl)):
+        preceding_hop_trusted = self._release_cdn_trusted and _origin_permits_release_cdn(
+            req.full_url
+        )
+        if not (preceding_hop_trusted and _is_release_cdn_url(newurl)):
             _validate_download_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -240,13 +255,20 @@ def resolve_download_url(version_info):
     `download_url` (`""`, `None`) still falls back to `url` deliberately:
     an empty string is not a usable URL either, so treating it the same as
     a missing key is correct, not a bug to "fix" by distinguishing them.
+
+    Each field is checked independently rather than joined with a single
+    `A.get() or B.get()` -- that pattern short-circuits on ANY truthy
+    primary value, including a truthy-but-non-string one (e.g. a stray
+    integer under `download_url`), discarding a perfectly usable `url`
+    fallback instead of ever trying it.
     """
     if not isinstance(version_info, dict):
         return None
-    url = version_info.get(_DOWNLOAD_URL_FIELD_NAME) or version_info.get(
-        _DOWNLOAD_URL_FALLBACK_FIELD_NAME
-    )
-    return url if isinstance(url, str) else None
+    primary = version_info.get(_DOWNLOAD_URL_FIELD_NAME)
+    if isinstance(primary, str) and primary:
+        return primary
+    fallback = version_info.get(_DOWNLOAD_URL_FALLBACK_FIELD_NAME)
+    return fallback if isinstance(fallback, str) and fallback else None
 
 
 def fetch_version_info():
@@ -651,6 +673,24 @@ def _build_launch_healthcheck_command(exe_path: str) -> str:
     return f'powershell -NoProfile -NonInteractive -Command "{ps_command}"\n'
 
 
+# Round 28 finding: cmd.exe's `timeout` (and `ping`-based delay tricks) rely
+# on an attached console -- under the exact flags apply_update() actually
+# launches update.bat with (subprocess.CREATE_NO_WINDOW |
+# subprocess.DETACHED_PROCESS, see below), `timeout.exe` has no console to
+# read from and exits almost immediately with a non-zero errorlevel
+# instead of waiting. Measured directly: `timeout /t 3 /nobreak >nul` under
+# those same flags completed in ~50ms, not 3000ms. This silently no-op'd
+# BOTH the Round 27 pre-launch settle delay below AND this script's
+# pre-existing between-retries wait inside `:launchtry` -- neither ever
+# actually waited. PowerShell's `Start-Sleep`, already proven to work
+# under these exact flags by `_build_launch_healthcheck_command` above,
+# does not have this problem (measured: `Start-Sleep -Seconds 2` under the
+# same no-console flags took ~2.4s, as requested).
+_NO_CONSOLE_SAFE_DELAY_CMD = (
+    'powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 1"\n'
+)
+
+
 def apply_update(download_url, version_info=None, *, progress_callback=None,
                  download_only: bool = False, reuse_download: bool = False):
     """Download, verify and stage an update.
@@ -923,18 +963,19 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
         # keeps it running) even though it never actually started, so
         # :confirmed fired on a broken build. This settle delay sits
         # BEFORE the first Start-Process attempt (not just between retries,
-        # which :launchtry's own timeout below already covers), narrowing
+        # which :launchtry's own delay below already covers), narrowing
         # -- not eliminating -- that race, the same proportionate way the
         # renwait polling loop and pre-move reverify step already narrow
-        # theirs elsewhere in this script.
-        "timeout /t 1 /nobreak >nul\n"
+        # theirs elsewhere in this script. See `_NO_CONSOLE_SAFE_DELAY_CMD`
+        # for why this can't be a plain `timeout` command.
+        f"{_NO_CONSOLE_SAFE_DELAY_CMD}"
         "set LAUNCHRETRIES=0\n"
         ":launchtry\n"
         f"{launch_healthcheck_cmd}"
         "if not errorlevel 1 goto :confirmed\n"
         "set /a LAUNCHRETRIES+=1\n"
         "if %LAUNCHRETRIES% GEQ 2 goto :launchfail\n"
-        "timeout /t 1 /nobreak >nul\n"
+        f"{_NO_CONSOLE_SAFE_DELAY_CMD}"
         "goto :launchtry\n"
         "goto :launchfail\n"
         ":confirmed\n"

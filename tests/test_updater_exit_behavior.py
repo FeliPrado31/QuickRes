@@ -113,3 +113,30 @@ def test_install_downloaded_update_passes_reuse_download_and_no_url(monkeypatch)
     updater.install_downloaded_update(version_info={"version": "2.0"})
 
     assert calls == [(None, {"version": "2.0"}, {"reuse_download": True})]
+
+
+def test_bridge_op_force_exits_on_system_exit_as_a_structural_backstop(monkeypatch):
+    # Round 28 finding: bridge_op's own `except Exception` cannot catch
+    # SystemExit (it's a BaseException, not an Exception), so a wrapped
+    # method that raises SystemExit directly -- not just apply_update()'s
+    # two known callers, which route through their own
+    # _force_exit_on_expected_system_exit wrapper -- would previously kill
+    # only the pywebview worker thread it ran on, leaving the window hung
+    # forever. bridge_op itself must force-exit as a backstop, protecting
+    # every current AND FUTURE Api method automatically instead of relying
+    # on each call site to remember to wrap itself.
+    from quickres.webview import bridge as bridge_module
+
+    exit_calls = []
+    monkeypatch.setattr(bridge_module.os, "_exit", lambda code: exit_calls.append(code))
+
+    @bridge_module.bridge_op()
+    def raises_system_exit(self):
+        raise SystemExit(0)
+
+    class _FakeApi:
+        pass
+
+    raises_system_exit(_FakeApi())
+
+    assert exit_calls == [0]

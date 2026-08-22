@@ -117,7 +117,17 @@ class TestResolveDownloadUrl:
         # input, which would surface as an unhandled crash instead of the
         # module's usual fail-closed "Refusing to download..." error.
         assert updater.resolve_download_url({"url": 12345}) is None
-        assert updater.resolve_download_url({"download_url": 12345, "url": "https://x"}) is None
+
+    def test_non_string_download_url_still_falls_back_to_valid_url_field(self):
+        # `A.get() or B.get()` short-circuits on ANY truthy value, including
+        # a truthy-but-non-string one -- a malformed download_url must not
+        # discard a perfectly usable url fallback.
+        assert (
+            updater.resolve_download_url(
+                {"download_url": 12345, "url": "https://lxzy.my/QuickRes.exe"}
+            )
+            == "https://lxzy.my/QuickRes.exe"
+        )
 
 
 class TestBridgeCheckUpdatesReportsUpdateAvailable:
@@ -182,6 +192,29 @@ class TestBridgeCheckUpdatesReportsUpdateAvailable:
         assert result["data"]["download_url"] == "https://lxzy.my/QuickRes.exe"
         # Raw field is preserved alongside the normalized one.
         assert result["data"]["url"] == "https://lxzy.my/QuickRes.exe"
+
+    def test_malformed_raw_download_url_does_not_leak_past_failed_resolution(
+        self, monkeypatch
+    ):
+        # {**info} in check_updates() copies the server's raw fields first,
+        # INCLUDING a malformed download_url -- the resolved value must
+        # always overwrite that key (even to None), never leave the raw
+        # value in place just because resolution didn't find anything
+        # better. Otherwise a truthy-but-invalid value (12345) reaches
+        # panel.html's `if (!S.updateInfo.download_url) return;` guard,
+        # passes it (12345 is truthy in JS), and crashes deep inside
+        # apply_update() with a confusing AttributeError instead of the
+        # clean "no update available" no-op this should be.
+        api = self._frozen_api(monkeypatch)
+        monkeypatch.setattr(
+            "quickres.webview.bridge.updater.fetch_version_info",
+            lambda: {"version": "99.0.0", "download_url": 12345},
+        )
+
+        result = api.check_updates()
+
+        assert result["ok"] is True
+        assert result["data"]["download_url"] is None
 
     def test_not_frozen_still_returns_none_without_fetching(self, monkeypatch):
         monkeypatch.setattr("quickres.webview.bridge.sys.frozen", False, raising=False)
