@@ -129,3 +129,48 @@ class TestRealGeneratedUpdateBatScriptHasConsistentLabelGraph:
         # update.bat must resolve to a matching `:label` definition
         # somewhere in that same script.
         updater._validate_batch_label_graph(script)
+
+
+class TestValidateNoConsoleDependentDelayCommands:
+    """Round 28 finding (4th review pass): three separate rounds each
+    found ONE occurrence of the same bug class -- `timeout /t N /nobreak`
+    silently no-ops instead of waiting under the exact
+    CREATE_NO_WINDOW|DETACHED_PROCESS flags update.bat is actually
+    launched with -- in a different part of the generated script, one at
+    a time. A per-section string assertion only catches a REGRESSION in
+    the specific spot it targets; it does nothing for a brand new
+    occurrence introduced somewhere else. This static check scans the
+    WHOLE generated script for the banned command, the same class of
+    defense `_validate_batch_label_graph` already provides for dangling
+    goto targets.
+    """
+
+    def test_raises_on_a_console_dependent_timeout_command(self):
+        broken_script = (
+            "@echo off\n"
+            ":renwait\n"
+            "timeout /t 1 /nobreak >nul\n"
+            "goto :renwait\n"
+        )
+
+        with pytest.raises(AssertionError, match="timeout"):
+            updater._validate_no_console_dependent_delay(broken_script)
+
+    def test_passes_on_the_working_powershell_based_delay(self):
+        good_script = (
+            "@echo off\n"
+            ":renwait\n"
+            f"{updater._NO_CONSOLE_SAFE_DELAY_CMD}"
+            "goto :renwait\n"
+        )
+        # Must not raise.
+        updater._validate_no_console_dependent_delay(good_script)
+
+    def test_apply_update_bat_contents_never_contains_timeout_command(
+        self, monkeypatch, tmp_path
+    ):
+        script = _real_generated_script(monkeypatch, tmp_path)
+
+        # Must not raise -- the real generated update.bat must never use
+        # `timeout` anywhere, in any of its retry/settle-delay loops.
+        updater._validate_no_console_dependent_delay(script)

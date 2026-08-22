@@ -94,9 +94,16 @@ class TestFixedSleepReplacedWithPollingRetry:
 
         # A retry loop needs: a short wait after a failed rename, and a
         # jump back to retry the rename again, rather than giving up
-        # immediately.
+        # immediately. Round 28 finding: `timeout /t 1` is a no-op under
+        # this script's actual no-console launch flags -- the wait must
+        # use the PowerShell-based delay instead (see
+        # _NO_CONSOLE_SAFE_DELAY_CMD and
+        # test_no_console_safe_delay_actually_waits in
+        # test_updater_launch_confirmation_backoff.py for the executed
+        # proof that it actually waits).
         after = "\n".join(lines[ren_idx:])
-        assert "timeout /t 1" in after
+        assert "timeout /t 1" not in after
+        assert 'start-sleep -seconds 1"' in after.lower()
         # The rename attempt must be reachable via a goto (i.e. actually
         # looped), not a single one-shot attempt.
         assert "goto" in after.lower()
@@ -130,8 +137,14 @@ class TestReverificationBeforeMove:
         self, monkeypatch, tmp_path
     ):
         script, _ = _generated_script(monkeypatch, tmp_path)
+        # Round 28 finding: the generated script now has MULTIPLE
+        # "powershell"-starting lines (the settle/retry delays also use
+        # PowerShell) -- must specifically target the reverify command by
+        # its own unique signature, not just the first powershell line.
         ps_line = next(
-            l for l in script.splitlines() if l.strip().lower().startswith("powershell")
+            l
+            for l in script.splitlines()
+            if l.strip().lower().startswith("powershell") and "readallbytes" in l.lower()
         )
         # Structural PE-header re-check (MZ magic byte values) must be
         # present even when no expected hash was supplied.
@@ -146,7 +159,9 @@ class TestReverificationBeforeMove:
             monkeypatch, tmp_path, version_info={"sha256": expected}
         )
         ps_line = next(
-            l for l in script.splitlines() if l.strip().lower().startswith("powershell")
+            l
+            for l in script.splitlines()
+            if l.strip().lower().startswith("powershell") and "readallbytes" in l.lower()
         )
         assert "Get-FileHash" in ps_line
         assert expected.upper() in ps_line

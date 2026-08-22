@@ -409,6 +409,19 @@ def bridge_op(*, lock: bool = False, boot_armed_bypass: bool = False, releases_b
                 # and still no-ops for a boot_armed_bypass call that never
                 # acquired one to begin with.
                 return {"ok": False, "kind": "busy", "data": None, "message": str(exc)}
+            except SystemExit:
+                # Round 28 finding: a structural backstop, not just relying
+                # on individual call sites (updater.confirm_update /
+                # updater.install_downloaded_update already wrap
+                # themselves) to remember this. A plain SystemExit raised
+                # here only kills the pywebview worker thread this method
+                # runs on, not the whole process, leaving the window hung
+                # forever -- os._exit(0) is what actually closes it. Placed
+                # before `except Exception` for clarity, though order
+                # doesn't matter for catching: SystemExit is a
+                # BaseException, never caught by `except Exception`.
+                log_msg(f"{fn.__name__} raised SystemExit; force-exiting.")
+                os._exit(0)
             except Exception as exc:
                 log_msg(f"{fn.__name__} failed: {exc!r}\n{traceback.format_exc()}")
                 return {"ok": False, "kind": "error", "data": None,
@@ -850,7 +863,30 @@ class Api:
         # stream (panel.html) can render a real dialog only when warranted,
         # instead of on every successful fetch regardless of version.
         info = updater.fetch_version_info()
-        return {**info, "update_available": updater.update_available(__version__, info)}
+        # "download_url" is set in THIS SAME literal (not a separate
+        # statement after) so the resolved value structurally always wins
+        # over whatever {**info} would have copied for that key -- {**info}
+        # may include a raw, malformed "download_url" straight from the
+        # server response (e.g. a non-string value), and a later, separate
+        # assignment could too easily be "improved" into a conditional
+        # (e.g. only set when non-None) that would let that raw value leak
+        # through to panel.html's truthiness check and crash deep inside
+        # apply_update() with a confusing error.
+        #
+        # `{**info}` needs its own guard here: `updater.update_available`
+        # and `updater.resolve_download_url` already fail closed on a
+        # non-dict `info` (a plausible fetch_version_info() outcome -- the
+        # server could return a bare JSON null/list/string/number), but
+        # unpacking a non-dict with `**` raises TypeError before either of
+        # those calls even runs, surfacing a raw, confusing error instead
+        # of the same graceful "no update available" both were hardened to
+        # produce.
+        base = info if isinstance(info, dict) else {}
+        return {
+            **base,
+            "update_available": updater.update_available(__version__, info),
+            "download_url": updater.resolve_download_url(info),
+        }
 
     def _prepare_update_handoff_locked(self):
         """Best-effort safety hand-off before an update exits this process.
@@ -879,9 +915,10 @@ class Api:
         # handling every other lock=True method gets), so no UI change is
         # needed.
         #
-        # updater.confirm_update can force-kill this process with
-        # os._exit(0) (inside apply_update, once the download is verified
-        # and staged) -- os._exit skips normal interpreter shutdown, so
+        # Both updater.confirm_update AND updater.install_downloaded_update
+        # can force-kill this process with os._exit(0) (once the download
+        # is verified and staged) -- os._exit skips normal interpreter
+        # shutdown, so
         # webview/app.py's window "closing" event, and therefore its
         # _on_closing handler, never runs. _on_closing is the only other
         # place that gives a still-armed 10s auto-revert guard
@@ -1010,12 +1047,21 @@ class Api:
         job = self._update_job
         if job is None or job.snapshot().get("stage") != "ready":
             raise RuntimeError("No verified update is ready to install")
+        version_info = job.version_info
+        # Round 28 finding: clear BEFORE calling, not after -- if
+        # updater.install_downloaded_update raises (network/disk failure,
+        # a corrupted staged file caught by apply_update's own
+        # re-verification), bridge_op's method-body-has-no-try/except
+        # convention means there is no "after" to clear it in; the
+        # exception propagates straight through. Leaving the stale "ready"
+        # job in place would make start_update()'s busy-check see it
+        # forever, permanently reporting the failed job's state instead of
+        # ever starting a fresh attempt. Harmless on the success path too:
+        # that path force-exits the whole process before this reference
+        # would ever be read again.
+        self._update_job = None
         self._prepare_update_handoff_locked()
-        return updater.apply_update(
-            None,
-            version_info=job.version_info,
-            reuse_download=True,
-        )
+        return updater.install_downloaded_update(version_info=version_info)
 
     @bridge_op()
     def list_monitors(self):

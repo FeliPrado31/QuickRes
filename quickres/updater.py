@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -41,11 +42,33 @@ _GITHUB_REPO_PATH_PREFIX = "/lxzydev/QuickRes/"
 _DOWNLOAD_CHUNK_BYTES = 256 * 1024
 
 
-def _validate_download_url(url: str) -> None:
+def _has_https_scheme_and_allowed_host(url: str, allowed_hosts) -> bool:
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname not in _DOWNLOAD_URL_ALLOWED_HOSTS:
+    return parsed.scheme == "https" and parsed.hostname in allowed_hosts
+
+
+def _validate_download_url(url: str) -> None:
+    if not _has_https_scheme_and_allowed_host(url, _DOWNLOAD_URL_ALLOWED_HOSTS):
         raise ValueError(f"Refusing to download update from non-allowlisted URL: {url!r}")
-    if parsed.hostname == "github.com" and not parsed.path.startswith(
+    parsed = urllib.parse.urlsplit(url)
+    # Round 28 finding: comparing the RAW, unnormalized path let a URL
+    # containing enough `../` segments to actually escape the repo scope
+    # after normalization (standard RFC 3986 behavior for most HTTP
+    # servers/CDNs, including how GitHub's own edge is expected to route)
+    # still pass, since the raw string can literally start with
+    # "/lxzydev/QuickRes/" while normalizing to somewhere else entirely.
+    # posixpath.normpath collapses `..`/`.` segments the same way; this
+    # module's new CDN-redirect-trust mechanism (_origin_permits_release_cdn)
+    # builds its trust decision on this exact check passing, so a bypass
+    # here would also earn undeserved CDN-redirect trust.
+    #
+    # Round 28 finding (4th pass): normpath alone has nothing literal to
+    # collapse when the `../` segments are percent-encoded ("%2e%2e")
+    # rather than literal -- unquote() FIRST, matching how a server that
+    # decodes-then-normalizes (standard practice) would actually route the
+    # request, so this check sees what the real request would resolve to.
+    normalized_path = posixpath.normpath(urllib.parse.unquote(parsed.path))
+    if parsed.hostname == "github.com" and not normalized_path.startswith(
         _GITHUB_REPO_PATH_PREFIX
     ):
         raise ValueError(
@@ -53,6 +76,41 @@ def _validate_download_url(url: str) -> None:
             f"this project's own repository ({_GITHUB_REPO_PATH_PREFIX!r}): "
             f"{url!r}"
         )
+
+
+# Round 25 finding: a real GitHub Releases redirect
+# (github.com/lxzydev/QuickRes/... -> objects.githubusercontent.com) was
+# being rejected outright, because the CDN host is intentionally NOT in
+# _DOWNLOAD_URL_ALLOWED_HOSTS -- a server-supplied CDN host would defeat the
+# allowlist entirely (see _origin_permits_release_cdn below: this constant
+# is hardcoded, NEVER read from any network response). GitHub has also been
+# migrating release-asset redirects between these two hosts, so both are
+# listed; each is only ever reachable through the provenance gate below, so
+# listing both widens nothing outside a repo-scoped GitHub origin.
+_GITHUB_RELEASE_CDN_HOSTS = frozenset(
+    {"objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+)
+
+
+def _origin_permits_release_cdn(origin_url) -> bool:
+    """Returns True only when `origin_url` (a) already passed
+    `_validate_download_url` AND (b) has hostname exactly "github.com" --
+    which, combined with (a), implies the origin's path also passed the
+    `_GITHUB_REPO_PATH_PREFIX` check. Condition (b) is NOT redundant with
+    (a): `lxzy.my` origins independently satisfy (a) but must NOT satisfy
+    (b), so they must never earn CDN-redirect trust.
+    """
+    if not isinstance(origin_url, str):
+        return False
+    try:
+        _validate_download_url(origin_url)
+    except ValueError:
+        return False
+    return urllib.parse.urlsplit(origin_url).hostname == "github.com"
+
+
+def _is_release_cdn_url(url: str) -> bool:
+    return _has_https_scheme_and_allowed_host(url, _GITHUB_RELEASE_CDN_HOSTS)
 
 
 class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -72,11 +130,61 @@ class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
     This handler re-validates every redirect target with
     `_validate_download_url` BEFORE `HTTPRedirectHandler` is allowed to
     build the follow-up request, so an unallowlisted redirect target is
-    refused pre-flight rather than merely detected post-hoc.
+    refused pre-flight rather than merely detected post-hoc -- UNLESS the
+    narrow, deliberate CDN-redirect-trust carve-out below applies, in
+    which case that one check is skipped in favor of the CDN-host-only
+    check `_redirect_skips_standard_validation` performs instead. This is
+    not "every redirect, no exceptions"; see that method for the exact
+    condition.
+
+    `origin_url` is the caller's own already-known request URL for this one
+    call (see `fetch_version_info`/`apply_update`). Whether THAT origin
+    earns CDN-redirect trust is computed ONCE here, at construction time,
+    and held only as per-instance state -- never module-level or otherwise
+    shared across calls -- so it cannot leak between unrelated requests.
+    Defaulting to `None` fails closed (no provenance) and keeps direct
+    no-arg construction (as in existing tests) unchanged.
+
+    Round 28 finding: that construction-time flag alone is NOT sufficient
+    for a multi-hop redirect chain -- `redirect_request` also re-checks
+    `req.full_url` (the URL of the request that just received THIS
+    specific redirect, i.e. the immediately-preceding hop) on every call,
+    and only grants CDN trust when BOTH the original construction-time
+    origin AND the immediately-preceding hop independently qualify.
+    Without this, a chain that starts at a trusted github.com origin but
+    is redirected through an intermediate non-github.com hop (e.g.
+    lxzy.my) before reaching the CDN would keep the ORIGINAL trust even
+    though the hop that actually preceded the CDN redirect was never
+    itself a repo-scoped github.com URL.
     """
 
+    def __init__(self, origin_url=None):
+        super().__init__()
+        # Deliberately NOT named `_origin_permits_release_cdn` -- that name
+        # is already the module-level function computing this value, and a
+        # same-named instance attribute would shadow it, inviting a future
+        # `self._origin_permits_release_cdn(...)` call-site typo to try
+        # calling a bool instead of the function.
+        self._release_cdn_trusted = _origin_permits_release_cdn(origin_url)
+
+    def _redirect_skips_standard_validation(self, req, newurl) -> bool:
+        """True only when ALL THREE hold: (1) this handler's own
+        construction-time origin earned CDN trust, (2) the request that
+        just received THIS redirect (`req.full_url`, the immediately
+        preceding hop) independently earns it too, and (3) the redirect
+        target is actually one of the trusted CDN hosts. Named for what it
+        returns (may `_validate_download_url` be skipped for `newurl`),
+        not for any one of the three conditions alone.
+        """
+        return (
+            self._release_cdn_trusted
+            and _origin_permits_release_cdn(req.full_url)
+            and _is_release_cdn_url(newurl)
+        )
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _validate_download_url(newurl)
+        if not self._redirect_skips_standard_validation(req, newurl):
+            _validate_download_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -149,6 +257,55 @@ def update_available(current_version: str, version_info) -> bool:
     return is_newer_version(current_version, remote_version)
 
 
+# Round 26 finding: the live version.json response actually names the
+# download URL "url", not "download_url". Neither fetch_version_info() nor
+# apply_update() ever assumed a specific key here -- apply_update() always
+# receives download_url explicitly from its caller -- but panel.html reads
+# `S.updateInfo.download_url` off check_updates()'s raw passthrough, so a
+# server response using "url" left that field undefined and made the
+# "Update Now" button a silent no-op (panel.html's startUpdateDownload()
+# returns early with no error when download_url is falsy). This is the same
+# kind of server-schema convention as `_VERSION_FIELD_NAME` above:
+# `_DOWNLOAD_URL_FIELD_NAME` is this module's own best-effort convention
+# going forward, `_DOWNLOAD_URL_FALLBACK_FIELD_NAME` covers the server's
+# actual current key so today's live response keeps working without a
+# server-side change.
+_DOWNLOAD_URL_FIELD_NAME = "download_url"
+_DOWNLOAD_URL_FALLBACK_FIELD_NAME = "url"
+
+
+def resolve_download_url(version_info):
+    """Returns the download URL named in `version_info` under
+    `_DOWNLOAD_URL_FIELD_NAME` if present, else `_DOWNLOAD_URL_FALLBACK_FIELD_NAME`
+    (the server's actual current key), else `None`. Owns the field-name
+    convention so callers (`webview/bridge.py`'s `check_updates()`) never
+    need to know either key themselves, matching `update_available()`'s
+    existing pattern for `_VERSION_FIELD_NAME`.
+
+    Fails closed to `None` on a non-string value under either field --
+    `_validate_download_url()` (the only place this return value is ever
+    handed to) parses it with `urllib.parse.urlsplit()`, which raises an
+    unhandled `AttributeError` on a non-string input instead of the
+    intended, cleanly-reported `ValueError`. A present-but-falsy
+    `download_url` (`""`, `None`) still falls back to `url` deliberately:
+    an empty string is not a usable URL either, so treating it the same as
+    a missing key is correct, not a bug to "fix" by distinguishing them.
+
+    Each field is checked independently rather than joined with a single
+    `A.get() or B.get()` -- that pattern short-circuits on ANY truthy
+    primary value, including a truthy-but-non-string one (e.g. a stray
+    integer under `download_url`), discarding a perfectly usable `url`
+    fallback instead of ever trying it.
+    """
+    if not isinstance(version_info, dict):
+        return None
+    primary = version_info.get(_DOWNLOAD_URL_FIELD_NAME)
+    if isinstance(primary, str) and primary:
+        return primary
+    fallback = version_info.get(_DOWNLOAD_URL_FALLBACK_FIELD_NAME)
+    return fallback if isinstance(fallback, str) and fallback else None
+
+
 def fetch_version_info():
     request = urllib.request.Request(
         UPDATE_URL,
@@ -162,7 +319,7 @@ def fetch_version_info():
     # path, which re-validates every redirect target against the host
     # allowlist. Use the same dedicated opener here so a redirected
     # version-check response is re-validated too.
-    opener = urllib.request.build_opener(_AllowlistRedirectHandler())
+    opener = urllib.request.build_opener(_AllowlistRedirectHandler(UPDATE_URL))
     with opener.open(request, timeout=5) as resp:
         return json.loads(resp.read().decode())
 
@@ -446,6 +603,38 @@ def _validate_batch_label_graph(bat_contents: str) -> None:
     )
 
 
+_BATCH_TIMEOUT_COMMAND_RE = re.compile(r"\btimeout\b", re.IGNORECASE)
+
+
+def _validate_no_console_dependent_delay(bat_contents: str) -> None:
+    """Static, whole-script check that `bat_contents` never uses cmd.exe's
+    `timeout` command anywhere.
+
+    Round 28 finding: `timeout` requires an attached console. update.bat
+    is actually launched via `subprocess.Popen(..., creationflags=
+    subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)` (see
+    below), which has none -- under those exact flags, `timeout /t N
+    /nobreak` measured returning in ~50ms instead of actually waiting N
+    seconds, a silent no-op rather than a visible failure. Three separate
+    review rounds each found ONE occurrence of this same bug -- in the
+    rename-retry loop, the launch settle delay, and the launch retry loop
+    -- one at a time, in different parts of this generated script; a
+    per-section regression test only guards the ONE spot it targets, not
+    the whole script. This check closes the entire class at once, the
+    same way `_validate_batch_label_graph` closes dangling-goto typos
+    across the whole script rather than one branch at a time.
+
+    Every delay in this script must use `_NO_CONSOLE_SAFE_DELAY_CMD`
+    (PowerShell's `Start-Sleep`, proven under these exact flags) instead.
+    """
+    assert not _BATCH_TIMEOUT_COMMAND_RE.search(bat_contents), (
+        "generated batch script contains a `timeout` command, which "
+        "silently no-ops (returns almost immediately instead of waiting) "
+        "under this script's actual CREATE_NO_WINDOW|DETACHED_PROCESS "
+        "launch flags -- use _NO_CONSOLE_SAFE_DELAY_CMD instead"
+    )
+
+
 def _build_reverify_command(new_exe_path: str, expected_sha256) -> str:
     """Build the `update.bat` step that re-verifies the staged
     `QuickRes_new.exe` IMMEDIATELY BEFORE the `move /y` that stages it, to
@@ -551,6 +740,24 @@ def _build_launch_healthcheck_command(exe_path: str) -> str:
     return f'powershell -NoProfile -NonInteractive -Command "{ps_command}"\n'
 
 
+# Round 28 finding: cmd.exe's `timeout` (and `ping`-based delay tricks) rely
+# on an attached console -- under the exact flags apply_update() actually
+# launches update.bat with (subprocess.CREATE_NO_WINDOW |
+# subprocess.DETACHED_PROCESS, see below), `timeout.exe` has no console to
+# read from and exits almost immediately with a non-zero errorlevel
+# instead of waiting. Measured directly: `timeout /t 3 /nobreak >nul` under
+# those same flags completed in ~50ms, not 3000ms. This silently no-op'd
+# BOTH the Round 27 pre-launch settle delay below AND this script's
+# pre-existing between-retries wait inside `:launchtry` -- neither ever
+# actually waited. PowerShell's `Start-Sleep`, already proven to work
+# under these exact flags by `_build_launch_healthcheck_command` above,
+# does not have this problem (measured: `Start-Sleep -Seconds 2` under the
+# same no-console flags took ~2.4s, as requested).
+_NO_CONSOLE_SAFE_DELAY_CMD = (
+    'powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 1"\n'
+)
+
+
 def apply_update(download_url, version_info=None, *, progress_callback=None,
                  download_only: bool = False, reuse_download: bool = False):
     """Download, verify and stage an update.
@@ -593,7 +800,7 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
         # would silently follow redirects to any host. A dedicated opener with
         # that handler must be built and used here so redirect targets are
         # actually re-validated for THIS request.
-        opener = urllib.request.build_opener(_AllowlistRedirectHandler())
+        opener = urllib.request.build_opener(_AllowlistRedirectHandler(download_url))
         # Same TOCTOU/symlink concern quickres/config.py's write_json_atomic
         # already guards against: plain open(new_exe_path, "wb") would
         # transparently follow an NTFS reparse point (symlink/junction) planted
@@ -761,7 +968,11 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
         "if not errorlevel 1 goto :renamed\n"
         "set /a RETRIES+=1\n"
         "if %RETRIES% GEQ 5 goto :renfail\n"
-        "timeout /t 1 /nobreak >nul\n"
+        # Round 28 finding: this was `timeout /t 1 /nobreak >nul` -- a
+        # no-op under this script's actual no-console launch flags, the
+        # same bug the launch-retry delays elsewhere in this script were
+        # fixed for. See `_NO_CONSOLE_SAFE_DELAY_CMD`.
+        f"{_NO_CONSOLE_SAFE_DELAY_CMD}"
         "goto :renwait\n"
         ":renfail\n"
         'echo %DATE% %TIME% update.bat: rename failed after retries, restoring >>"%QR_LOG%"\n'
@@ -809,16 +1020,33 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
         # delay is naturally included in Start-Process, after which a live
         # process is confirmed after two seconds.  A genuine launch failure
         # gets one short retry before rollback, keeping the failure path
-        # bounded to roughly five seconds instead of the old 36-second poll.
+        # bounded to roughly six seconds (the settle delay below plus two
+        # health-check windows and one between-attempts wait) instead of
+        # the old 36-second poll.
         ":launch\n"
         'echo %DATE% %TIME% update.bat: launching updated exe >>"%QR_LOG%"\n'
+        # Round 27 finding: `move /y` (and `:restore`'s own rename) can
+        # hand control back before the OS/antivirus have fully released
+        # the just-written exe. Start-Process launched it immediately in
+        # that window once and hit a native loader error ("Failed to load
+        # Python DLL ... LoadLibrary") -- the process still counted as
+        # "alive" for the 2-second health check (a blocking MessageBox
+        # keeps it running) even though it never actually started, so
+        # :confirmed fired on a broken build. This settle delay sits
+        # BEFORE the first Start-Process attempt (not just between retries,
+        # which :launchtry's own delay below already covers), narrowing
+        # -- not eliminating -- that race, the same proportionate way the
+        # renwait polling loop and pre-move reverify step already narrow
+        # theirs elsewhere in this script. See `_NO_CONSOLE_SAFE_DELAY_CMD`
+        # for why this can't be a plain `timeout` command.
+        f"{_NO_CONSOLE_SAFE_DELAY_CMD}"
         "set LAUNCHRETRIES=0\n"
         ":launchtry\n"
         f"{launch_healthcheck_cmd}"
         "if not errorlevel 1 goto :confirmed\n"
         "set /a LAUNCHRETRIES+=1\n"
         "if %LAUNCHRETRIES% GEQ 2 goto :launchfail\n"
-        "timeout /t 1 /nobreak >nul\n"
+        f"{_NO_CONSOLE_SAFE_DELAY_CMD}"
         "goto :launchtry\n"
         "goto :launchfail\n"
         ":confirmed\n"
@@ -861,6 +1089,7 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
     # `apply_update` failure is) instead of only at runtime during an actual
     # failed update.
     _validate_batch_label_graph(bat_contents)
+    _validate_no_console_dependent_delay(bat_contents)
 
     # Same reparse-point concern as the download write above, arguably more
     # severe here: this is the file that gets EXECUTED (via subprocess.Popen
@@ -884,21 +1113,50 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
     sys.exit(0)
 
 
+def _force_exit_on_expected_system_exit(run) -> None:
+    """Shared by `confirm_update` and `install_downloaded_update`: calls
+    `run()` and, if it raises the `SystemExit` that a successful
+    `apply_update` always ends in, force-exits via `os._exit(0)` instead of
+    letting it propagate as a normal `SystemExit`.
+
+    `os._exit(0)` skips Python's normal interpreter shutdown/atexit
+    handlers -- safe and desired here: the exe on disk has just been
+    renamed out from under the running process, so a normal clean shutdown
+    path could still try to touch it. It also guarantees the WHOLE
+    process exits when `run()` is invoked from a pywebview JS-bridge call:
+    pywebview dispatches `js_api` calls off the main thread, and a plain
+    `SystemExit` raised there only terminates that ONE worker thread, not
+    the process -- exactly the bug `install_downloaded_update` closes (see
+    its own docstring). `webview/bridge.py`'s `bridge_op` decorator ALSO
+    force-exits on `SystemExit` as a structural backstop for every wrapped
+    `Api` method, including these two -- so for the actual production call
+    paths (both go through `bridge_op`), this wrapper's own `os._exit(0)`
+    is redundant with that backstop, not the only thing standing between a
+    stray `SystemExit` and a hung window. Deliberate belt-and-suspenders,
+    matching this module's existing TOCTOU-reverify philosophy elsewhere:
+    kept here anyway so `confirm_update`/`install_downloaded_update` are
+    each independently correct even if ever called from somewhere that
+    ISN'T `bridge_op`-wrapped.
+
+    Any OTHER exception (network failure, disk-full, etc.) is NOT
+    force-exited -- it propagates normally so `bridge_op` (or, for the
+    one-shot `confirm_update` path, its own caller) reports it to the UI
+    while the app stays alive.
+    """
+    try:
+        run()
+    except SystemExit:
+        log_msg("Update staged successfully; force-exiting to complete install.")
+        os._exit(0)
+
+
 def confirm_update(download_url: str, version_info=None) -> None:
     """Distinguishes an expected clean-exit case from a genuine failure
     that must be reported to the UI, owned here rather than in
     `webview/bridge.py` so `Api.confirm_update` can stay a zero-try/except
     one-line delegation (bridge.py enforces exactly one `try:` in the whole
-    file, inside `bridge_op`).
-
-    `apply_update` staging a successful update ends in `sys.exit(0)`
-    (expected `SystemExit`) -- that is the ONLY case that force-exits via
-    `os._exit(0)`, which skips Python's normal interpreter shutdown/atexit
-    handlers (safe and desired here: the exe on disk has just been renamed
-    out from under the running process, so a normal clean shutdown path
-    could still try to touch it). Any OTHER exception (network failure,
-    disk-full, etc.) is NOT force-exited -- it propagates normally so the
-    bridge_op decorator reports it to the UI while the app stays alive.
+    file, inside `bridge_op`). See `_force_exit_on_expected_system_exit`
+    for why a plain `SystemExit` isn't enough here.
 
     `version_info` is an optional pass-through of fetch_version_info()'s
     JSON response so `apply_update` can pull an expected sha256 out of it,
@@ -907,7 +1165,24 @@ def confirm_update(download_url: str, version_info=None) -> None:
     `webview/bridge.py` call site (`updater.confirm_update(download_url)`)
     keeps working unchanged.
     """
-    try:
-        apply_update(download_url, version_info=version_info)
-    except SystemExit:
-        os._exit(0)
+    _force_exit_on_expected_system_exit(
+        lambda: apply_update(download_url, version_info=version_info)
+    )
+
+
+def install_downloaded_update(version_info=None) -> None:
+    """Force-exit counterpart of `confirm_update` for the `reuse_download`
+    (already-downloaded, already-verified) install path used by
+    `UpdateJob`/`webview/bridge.py`'s non-blocking download-then-install
+    flow. See `_force_exit_on_expected_system_exit` for why this can't
+    just let `apply_update`'s terminal `sys.exit(0)` propagate on its
+    own: called from a pywebview JS-bridge thread, a plain `SystemExit`
+    there only kills that ONE worker thread, leaving the original window
+    running indefinitely (its own poll loop stuck on a JS promise that
+    never resolves) while `update.bat`'s own `Start-Process` launch of the
+    replacement exe races that still-alive original process's
+    single-instance mutex.
+    """
+    _force_exit_on_expected_system_exit(
+        lambda: apply_update(None, version_info=version_info, reuse_download=True)
+    )
