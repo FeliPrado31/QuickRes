@@ -79,3 +79,40 @@ def test_install_verified_update_uses_safety_handoff_and_existing_rollback_path(
     assert result["ok"] is True
     assert result["data"] == {"started": True}
     assert events == ["handoff", "apply"]
+
+
+def test_failed_install_clears_the_stale_job_instead_of_deadlocking_retries(
+    monkeypatch,
+):
+    # Round 28 finding (4th pass): if updater.install_downloaded_update()
+    # raises (network/disk failure, a corrupted staged file caught by
+    # apply_update's own re-verification, etc.) and self._update_job is
+    # never reset, get_update_status()/start_update()'s busy-check keeps
+    # seeing the SAME stale "ready" job forever -- every future update
+    # attempt reports the old failed job's state instead of starting
+    # fresh, with no recovery short of restarting the whole app.
+    class ReadyJob:
+        version_info = {"version": "2.0"}
+
+        def snapshot(self):
+            return {
+                "stage": "ready", "downloaded_bytes": 20,
+                "total_bytes": 20, "error": None,
+            }
+
+    api = Api()
+    api._update_job = ReadyJob()
+    monkeypatch.setattr(api, "_prepare_update_handoff_locked", lambda: None)
+
+    def _raise(version_info=None):
+        raise ConnectionError("network is down")
+
+    monkeypatch.setattr(
+        "quickres.webview.bridge.updater.install_downloaded_update", _raise
+    )
+
+    result = api.install_downloaded_update()
+
+    assert result["ok"] is False
+    assert api._update_job is None
+    assert api.get_update_status()["data"]["stage"] == "idle"

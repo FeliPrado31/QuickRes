@@ -61,7 +61,13 @@ def _validate_download_url(url: str) -> None:
     # module's new CDN-redirect-trust mechanism (_origin_permits_release_cdn)
     # builds its trust decision on this exact check passing, so a bypass
     # here would also earn undeserved CDN-redirect trust.
-    normalized_path = posixpath.normpath(parsed.path)
+    #
+    # Round 28 finding (4th pass): normpath alone has nothing literal to
+    # collapse when the `../` segments are percent-encoded ("%2e%2e")
+    # rather than literal -- unquote() FIRST, matching how a server that
+    # decodes-then-normalizes (standard practice) would actually route the
+    # request, so this check sees what the real request would resolve to.
+    normalized_path = posixpath.normpath(urllib.parse.unquote(parsed.path))
     if parsed.hostname == "github.com" and not normalized_path.startswith(
         _GITHUB_REPO_PATH_PREFIX
     ):
@@ -124,7 +130,12 @@ class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
     This handler re-validates every redirect target with
     `_validate_download_url` BEFORE `HTTPRedirectHandler` is allowed to
     build the follow-up request, so an unallowlisted redirect target is
-    refused pre-flight rather than merely detected post-hoc.
+    refused pre-flight rather than merely detected post-hoc -- UNLESS the
+    narrow, deliberate CDN-redirect-trust carve-out below applies, in
+    which case that one check is skipped in favor of the CDN-host-only
+    check `_redirect_skips_standard_validation` performs instead. This is
+    not "every redirect, no exceptions"; see that method for the exact
+    condition.
 
     `origin_url` is the caller's own already-known request URL for this one
     call (see `fetch_version_info`/`apply_update`). Whether THAT origin
@@ -592,6 +603,38 @@ def _validate_batch_label_graph(bat_contents: str) -> None:
     )
 
 
+_BATCH_TIMEOUT_COMMAND_RE = re.compile(r"\btimeout\b", re.IGNORECASE)
+
+
+def _validate_no_console_dependent_delay(bat_contents: str) -> None:
+    """Static, whole-script check that `bat_contents` never uses cmd.exe's
+    `timeout` command anywhere.
+
+    Round 28 finding: `timeout` requires an attached console. update.bat
+    is actually launched via `subprocess.Popen(..., creationflags=
+    subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)` (see
+    below), which has none -- under those exact flags, `timeout /t N
+    /nobreak` measured returning in ~50ms instead of actually waiting N
+    seconds, a silent no-op rather than a visible failure. Three separate
+    review rounds each found ONE occurrence of this same bug -- in the
+    rename-retry loop, the launch settle delay, and the launch retry loop
+    -- one at a time, in different parts of this generated script; a
+    per-section regression test only guards the ONE spot it targets, not
+    the whole script. This check closes the entire class at once, the
+    same way `_validate_batch_label_graph` closes dangling-goto typos
+    across the whole script rather than one branch at a time.
+
+    Every delay in this script must use `_NO_CONSOLE_SAFE_DELAY_CMD`
+    (PowerShell's `Start-Sleep`, proven under these exact flags) instead.
+    """
+    assert not _BATCH_TIMEOUT_COMMAND_RE.search(bat_contents), (
+        "generated batch script contains a `timeout` command, which "
+        "silently no-ops (returns almost immediately instead of waiting) "
+        "under this script's actual CREATE_NO_WINDOW|DETACHED_PROCESS "
+        "launch flags -- use _NO_CONSOLE_SAFE_DELAY_CMD instead"
+    )
+
+
 def _build_reverify_command(new_exe_path: str, expected_sha256) -> str:
     """Build the `update.bat` step that re-verifies the staged
     `QuickRes_new.exe` IMMEDIATELY BEFORE the `move /y` that stages it, to
@@ -1046,6 +1089,7 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
     # `apply_update` failure is) instead of only at runtime during an actual
     # failed update.
     _validate_batch_label_graph(bat_contents)
+    _validate_no_console_dependent_delay(bat_contents)
 
     # Same reparse-point concern as the download write above, arguably more
     # severe here: this is the file that gets EXECUTED (via subprocess.Popen

@@ -216,6 +216,28 @@ class TestBridgeCheckUpdatesReportsUpdateAvailable:
         assert result["ok"] is True
         assert result["data"]["download_url"] is None
 
+    def test_non_dict_version_info_fails_gracefully_not_with_raw_typeerror(
+        self, monkeypatch
+    ):
+        # Round 28 finding (4th pass): {**info} has no isinstance guard,
+        # unlike the sibling update_available()/resolve_download_url()
+        # calls on the same return statement (both already hardened
+        # against a malformed response). A non-dict top-level JSON value
+        # (server returns null, [], or a bare string/number) must produce
+        # the same graceful "no update available" outcome those two
+        # already produce, not a raw TypeError surfaced to the user.
+        api = self._frozen_api(monkeypatch)
+        monkeypatch.setattr(
+            "quickres.webview.bridge.updater.fetch_version_info",
+            lambda: None,
+        )
+
+        result = api.check_updates()
+
+        assert result["ok"] is True
+        assert result["data"]["update_available"] is False
+        assert result["data"]["download_url"] is None
+
     def test_not_frozen_still_returns_none_without_fetching(self, monkeypatch):
         monkeypatch.setattr("quickres.webview.bridge.sys.frozen", False, raising=False)
         fetch_calls = []

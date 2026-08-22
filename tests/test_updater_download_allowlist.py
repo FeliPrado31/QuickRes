@@ -65,6 +65,20 @@ class TestValidateDownloadUrl:
                 "../../../../attacker-org/evil-repo/x"
             )
 
+    def test_rejects_percent_encoded_path_traversal_that_escapes_repo_scope(self):
+        # Round 28 finding (4th pass): posixpath.normpath alone has nothing
+        # literal to collapse if the ".." segments are percent-encoded
+        # ("%2e%2e") rather than literal -- the raw string still starts
+        # with "/lxzydev/QuickRes/" and normpath leaves "%2e%2e" untouched
+        # since it isn't the literal characters "..". Must percent-decode
+        # BEFORE normalizing, matching how a server that decodes-then-
+        # normalizes would actually route the request.
+        with pytest.raises(ValueError):
+            updater._validate_download_url(
+                "https://github.com/lxzydev/QuickRes/releases/download/v1/"
+                "%2e%2e/%2e%2e/%2e%2e/%2e%2e/attacker-org/evil-repo/x"
+            )
+
     def test_accepts_dot_segments_that_stay_within_repo_scope(self):
         # A `../` that normalizes back to somewhere still under
         # /lxzydev/QuickRes/ must not be rejected just for containing dots.

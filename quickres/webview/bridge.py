@@ -872,8 +872,18 @@ class Api:
         # (e.g. only set when non-None) that would let that raw value leak
         # through to panel.html's truthiness check and crash deep inside
         # apply_update() with a confusing error.
+        #
+        # `{**info}` needs its own guard here: `updater.update_available`
+        # and `updater.resolve_download_url` already fail closed on a
+        # non-dict `info` (a plausible fetch_version_info() outcome -- the
+        # server could return a bare JSON null/list/string/number), but
+        # unpacking a non-dict with `**` raises TypeError before either of
+        # those calls even runs, surfacing a raw, confusing error instead
+        # of the same graceful "no update available" both were hardened to
+        # produce.
+        base = info if isinstance(info, dict) else {}
         return {
-            **info,
+            **base,
             "update_available": updater.update_available(__version__, info),
             "download_url": updater.resolve_download_url(info),
         }
@@ -1037,8 +1047,21 @@ class Api:
         job = self._update_job
         if job is None or job.snapshot().get("stage") != "ready":
             raise RuntimeError("No verified update is ready to install")
+        version_info = job.version_info
+        # Round 28 finding: clear BEFORE calling, not after -- if
+        # updater.install_downloaded_update raises (network/disk failure,
+        # a corrupted staged file caught by apply_update's own
+        # re-verification), bridge_op's method-body-has-no-try/except
+        # convention means there is no "after" to clear it in; the
+        # exception propagates straight through. Leaving the stale "ready"
+        # job in place would make start_update()'s busy-check see it
+        # forever, permanently reporting the failed job's state instead of
+        # ever starting a fresh attempt. Harmless on the success path too:
+        # that path force-exits the whole process before this reference
+        # would ever be read again.
+        self._update_job = None
         self._prepare_update_handoff_locked()
-        return updater.install_downloaded_update(version_info=job.version_info)
+        return updater.install_downloaded_update(version_info=version_info)
 
     @bridge_op()
     def list_monitors(self):
