@@ -110,6 +110,15 @@ class TestResolveDownloadUrl:
         assert updater.resolve_download_url(None) is None
         assert updater.resolve_download_url("not a dict") is None
 
+    def test_non_string_value_fails_closed_to_none(self):
+        # A malformed/unexpected non-string value under either field must
+        # not propagate to _validate_download_url() -- urllib.parse.urlsplit()
+        # raises AttributeError (not the intended ValueError) on a non-string
+        # input, which would surface as an unhandled crash instead of the
+        # module's usual fail-closed "Refusing to download..." error.
+        assert updater.resolve_download_url({"url": 12345}) is None
+        assert updater.resolve_download_url({"download_url": 12345, "url": "https://x"}) is None
+
 
 class TestBridgeCheckUpdatesReportsUpdateAvailable:
     def _frozen_api(self, monkeypatch):

@@ -41,10 +41,15 @@ _GITHUB_REPO_PATH_PREFIX = "/lxzydev/QuickRes/"
 _DOWNLOAD_CHUNK_BYTES = 256 * 1024
 
 
-def _validate_download_url(url: str) -> None:
+def _has_https_scheme_and_allowed_host(url: str, allowed_hosts) -> bool:
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname not in _DOWNLOAD_URL_ALLOWED_HOSTS:
+    return parsed.scheme == "https" and parsed.hostname in allowed_hosts
+
+
+def _validate_download_url(url: str) -> None:
+    if not _has_https_scheme_and_allowed_host(url, _DOWNLOAD_URL_ALLOWED_HOSTS):
         raise ValueError(f"Refusing to download update from non-allowlisted URL: {url!r}")
+    parsed = urllib.parse.urlsplit(url)
     if parsed.hostname == "github.com" and not parsed.path.startswith(
         _GITHUB_REPO_PATH_PREFIX
     ):
@@ -87,8 +92,7 @@ def _origin_permits_release_cdn(origin_url) -> bool:
 
 
 def _is_release_cdn_url(url: str) -> bool:
-    parsed = urllib.parse.urlsplit(url)
-    return parsed.scheme == "https" and parsed.hostname in _GITHUB_RELEASE_CDN_HOSTS
+    return _has_https_scheme_and_allowed_host(url, _GITHUB_RELEASE_CDN_HOSTS)
 
 
 class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -121,10 +125,15 @@ class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def __init__(self, origin_url=None):
         super().__init__()
-        self._origin_permits_release_cdn = _origin_permits_release_cdn(origin_url)
+        # Deliberately NOT named `_origin_permits_release_cdn` -- that name
+        # is already the module-level function computing this value, and a
+        # same-named instance attribute would shadow it, inviting a future
+        # `self._origin_permits_release_cdn(...)` call-site typo to try
+        # calling a bool instead of the function.
+        self._release_cdn_trusted = _origin_permits_release_cdn(origin_url)
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not (self._origin_permits_release_cdn and _is_release_cdn_url(newurl)):
+        if not (self._release_cdn_trusted and _is_release_cdn_url(newurl)):
             _validate_download_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -222,12 +231,22 @@ def resolve_download_url(version_info):
     convention so callers (`webview/bridge.py`'s `check_updates()`) never
     need to know either key themselves, matching `update_available()`'s
     existing pattern for `_VERSION_FIELD_NAME`.
+
+    Fails closed to `None` on a non-string value under either field --
+    `_validate_download_url()` (the only place this return value is ever
+    handed to) parses it with `urllib.parse.urlsplit()`, which raises an
+    unhandled `AttributeError` on a non-string input instead of the
+    intended, cleanly-reported `ValueError`. A present-but-falsy
+    `download_url` (`""`, `None`) still falls back to `url` deliberately:
+    an empty string is not a usable URL either, so treating it the same as
+    a missing key is correct, not a bug to "fix" by distinguishing them.
     """
     if not isinstance(version_info, dict):
         return None
-    return version_info.get(_DOWNLOAD_URL_FIELD_NAME) or version_info.get(
+    url = version_info.get(_DOWNLOAD_URL_FIELD_NAME) or version_info.get(
         _DOWNLOAD_URL_FALLBACK_FIELD_NAME
     )
+    return url if isinstance(url, str) else None
 
 
 def fetch_version_info():
@@ -890,7 +909,9 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
         # delay is naturally included in Start-Process, after which a live
         # process is confirmed after two seconds.  A genuine launch failure
         # gets one short retry before rollback, keeping the failure path
-        # bounded to roughly five seconds instead of the old 36-second poll.
+        # bounded to roughly six seconds (the settle delay below plus two
+        # health-check windows and one between-attempts wait) instead of
+        # the old 36-second poll.
         ":launch\n"
         'echo %DATE% %TIME% update.bat: launching updated exe >>"%QR_LOG%"\n'
         # Round 27 finding: `move /y` (and `:restore`'s own rename) can
@@ -979,21 +1000,40 @@ def apply_update(download_url, version_info=None, *, progress_callback=None,
     sys.exit(0)
 
 
+def _force_exit_on_expected_system_exit(run) -> None:
+    """Shared by `confirm_update` and `install_downloaded_update`: calls
+    `run()` and, if it raises the `SystemExit` that a successful
+    `apply_update` always ends in, force-exits via `os._exit(0)` instead of
+    letting it propagate as a normal `SystemExit`.
+
+    `os._exit(0)` skips Python's normal interpreter shutdown/atexit
+    handlers -- safe and desired here: the exe on disk has just been
+    renamed out from under the running process, so a normal clean shutdown
+    path could still try to touch it. It is also the only way to
+    guarantee the WHOLE process exits when `run()` is invoked from a
+    pywebview JS-bridge call: pywebview dispatches `js_api` calls off the
+    main thread, and a plain `SystemExit` raised there only terminates
+    that ONE worker thread, not the process -- exactly the bug
+    `install_downloaded_update` closes (see its own docstring).
+
+    Any OTHER exception (network failure, disk-full, etc.) is NOT
+    force-exited -- it propagates normally so `bridge_op` (or, for the
+    one-shot `confirm_update` path, its own caller) reports it to the UI
+    while the app stays alive.
+    """
+    try:
+        run()
+    except SystemExit:
+        os._exit(0)
+
+
 def confirm_update(download_url: str, version_info=None) -> None:
     """Distinguishes an expected clean-exit case from a genuine failure
     that must be reported to the UI, owned here rather than in
     `webview/bridge.py` so `Api.confirm_update` can stay a zero-try/except
     one-line delegation (bridge.py enforces exactly one `try:` in the whole
-    file, inside `bridge_op`).
-
-    `apply_update` staging a successful update ends in `sys.exit(0)`
-    (expected `SystemExit`) -- that is the ONLY case that force-exits via
-    `os._exit(0)`, which skips Python's normal interpreter shutdown/atexit
-    handlers (safe and desired here: the exe on disk has just been renamed
-    out from under the running process, so a normal clean shutdown path
-    could still try to touch it). Any OTHER exception (network failure,
-    disk-full, etc.) is NOT force-exited -- it propagates normally so the
-    bridge_op decorator reports it to the UI while the app stays alive.
+    file, inside `bridge_op`). See `_force_exit_on_expected_system_exit`
+    for why a plain `SystemExit` isn't enough here.
 
     `version_info` is an optional pass-through of fetch_version_info()'s
     JSON response so `apply_update` can pull an expected sha256 out of it,
@@ -1002,32 +1042,24 @@ def confirm_update(download_url: str, version_info=None) -> None:
     `webview/bridge.py` call site (`updater.confirm_update(download_url)`)
     keeps working unchanged.
     """
-    try:
-        apply_update(download_url, version_info=version_info)
-    except SystemExit:
-        os._exit(0)
+    _force_exit_on_expected_system_exit(
+        lambda: apply_update(download_url, version_info=version_info)
+    )
 
 
 def install_downloaded_update(version_info=None) -> None:
     """Force-exit counterpart of `confirm_update` for the `reuse_download`
     (already-downloaded, already-verified) install path used by
     `UpdateJob`/`webview/bridge.py`'s non-blocking download-then-install
-    flow.
-
-    `apply_update(reuse_download=True)` ends the same way `apply_update`
-    always does on success -- `sys.exit(0)`. Without this wrapper, that
-    `SystemExit` would propagate straight out of the pywebview JS-bridge
-    call it runs on: pywebview dispatches `js_api` calls off the main
-    thread, and a plain `SystemExit` raised there only terminates that ONE
-    worker thread, not the whole process. The original window is then left
+    flow. See `_force_exit_on_expected_system_exit` for why this can't
+    just let `apply_update`'s terminal `sys.exit(0)` propagate on its
+    own: called from a pywebview JS-bridge thread, a plain `SystemExit`
+    there only kills that ONE worker thread, leaving the original window
     running indefinitely (its own poll loop stuck on a JS promise that
     never resolves) while `update.bat`'s own `Start-Process` launch of the
     replacement exe races that still-alive original process's
-    single-instance mutex. `os._exit(0)` here, exactly like
-    `confirm_update` already does for the one-shot flow, is what actually
-    lets the whole process -- and therefore the stale window -- go away.
+    single-instance mutex.
     """
-    try:
-        apply_update(None, version_info=version_info, reuse_download=True)
-    except SystemExit:
-        os._exit(0)
+    _force_exit_on_expected_system_exit(
+        lambda: apply_update(None, version_info=version_info, reuse_download=True)
+    )
